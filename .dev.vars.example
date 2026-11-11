@@ -1,0 +1,27 @@
+# Copy to .dev.vars for local development (`npm run dev`). Never commit .dev.vars.
+# In production, set each one with:  npx wrangler secret put <NAME>
+
+# Required. 16+ random characters (openssl rand -hex 32). Protects /api/*.
+ADMIN_TOKEN=
+
+# Required. 16+ random characters. Keys the rate limit's daily hash (no IPs are stored).
+IP_SALT=
+
+# Required for file uploads. 16+ random characters. Signs download links.
+LINK_SECRET=
+
+# Optional: Turnstile secret key, for forms with "turnstile": true.
+# Cloudflare's test secret that always passes: 1x0000000000000000000000000000000AA
+TURNSTILE_SECRET_KEY=
+
+# Optional: one per webhook named in forms.json, e.g. "webhooks": ["discord"]
+# WEBHOOK_DISCORD_URL=https://discord.com/api/webhooks/...
+# Signs JSON webhooks (X-Perchlight-Signature).
+WEBHOOK_SECRET=
+
+# --- Only for MAIL_PROVIDER other than cloudflare-routing (needed for auto-replies) ---
+# RESEND_API_KEY=
+# AWS_ACCESS_KEY_ID=
+# AWS_SECRET_ACCESS_KEY=
+# MAILGUN_API_KEY=
+# POSTMARK_SERVER_TOKEN=

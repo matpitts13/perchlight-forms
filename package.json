@@ -1,0 +1,41 @@
+{
+  "name": "perchlight-forms",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A free, self-hosted form backend for static sites on Cloudflare Workers + D1 (+ R2 for uploads): plain HTML or fetch, spam folder, email and webhook notifications, exports.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
+    "test": "vitest run",
+    "check": "node cli/check-forms.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "cloudflare": {
+    "bindings": {
+      "ADMIN_TOKEN": {
+        "description": "Required. A long random string (16+ characters), e.g. from `openssl rand -hex 32`. Protects the admin API (/api/*): reading, exporting and deleting submissions."
+      },
+      "IP_SALT": {
+        "description": "Required. A long random string (16+ characters). Keys the rate limit's daily hash, so no IP address is ever stored. Forms answer 503 until it's set."
+      },
+      "LINK_SECRET": {
+        "description": "Required for file uploads. A long random string (16+ characters). Signs the expiring download links for attachments."
+      },
+      "TURNSTILE_SECRET_KEY": {
+        "description": "Optional. Your Turnstile secret key (dashboard > Turnstile), for forms with \"turnstile\": true. Leave empty otherwise."
+      },
+      "WEBHOOK_SECRET": {
+        "description": "Optional. Signs JSON webhooks (X-Perchlight-Signature). Needed only if a form sends to a JSON webhook."
+      }
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.6.1",
+    "vitest": "^5.1.0",
+    "wrangler": "^4.159.0"
+  }
+}

@@ -1,0 +1,71 @@
+// perchlight-forms: Worker + static pages + D1 (+ R2 if a form takes files).
+// Secrets are never set here. Locally they go in .dev.vars (see .dev.vars.example);
+// in production: npx wrangler secret put <NAME>
+//
+// No cron trigger, on purpose: the free plan allows 5 per account and the
+// rest of the Perchlight family uses 4. Retries and clean-up run lazily on
+// incoming requests (see docs/adr/0001-lazy-housekeeping-no-cron.md).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "perchlight-forms",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+
+  // The thank-you page, styles and the optional snippet are served as-is;
+  // the form endpoints, file links, problem page and API run the Worker.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/f/*", "/file/*", "/api/*", "/problem", "/problem/", "/tick"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "perchlight-forms",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Email to your own verified addresses (Email Routing > Destination
+  // addresses). Cloudflare: sending to verified destinations is free on all plans.
+  "send_email": [{ "name": "EMAIL" }],
+
+  // File uploads (only if a form has "file" fields). R2 asks for a payment
+  // method on file before you can turn it on, even inside the free tier.
+  // Create the bucket (npx wrangler r2 bucket create perchlight-forms-files)
+  // and uncomment. Never give the bucket public access or an r2.dev URL.
+  // "r2_buckets": [{ "binding": "FILES", "bucket_name": "perchlight-forms-files" }],
+
+  "vars": {
+    // An address on a domain with Email Routing on. Notifications come from it.
+    "MAIL_FROM": "",
+    // cloudflare-routing (free, your verified addresses only) | resend | ses | mailgun | postmark | cloudflare
+    // Auto-replies need one of the email services.
+    "MAIL_PROVIDER": "cloudflare-routing",
+    // Days kept. 0 = keep the inbox until you delete it.
+    "RETENTION_DAYS": "365",
+    "SPAM_RETENTION_DAYS": "30",
+    // Spam stored per UTC day (all forms); past it, spam is only counted.
+    "SPAM_DAILY_CAP": "1000",
+    // How long file links in notification emails work.
+    "FILE_LINK_HOURS": "168",
+    // Shown to visitors if a message couldn't be saved or emailed.
+    "FALLBACK_CONTACT": "",
+    // At most one housekeeping run (retries, clean-up) per this many minutes.
+    "HOUSEKEEPING_MINUTES": "5",
+    // Your Worker's public URL, for links in emails, e.g. https://forms.example.com
+    // (empty = the address the request came in on).
+    "PUBLIC_URL": "",
+
+    // Amazon SES
+    "AWS_REGION": "",
+    "SES_CONFIGURATION_SET": "",
+    // Mailgun: your sending domain, and "us" or "eu"
+    "MAILGUN_DOMAIN": "",
+    "MAILGUN_REGION": "us"
+  }
+
+  // Your own domain (for example forms.example.com), once it works on workers.dev:
+  // "routes": [{ "pattern": "forms.example.com", "custom_domain": true }]
+}

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://perchlight.ravenburst.com/schema/v1.json",
+  "version": 1,
+  "views": [
+    {
+      "id": "forms-inbox",
+      "title": "Form inbox",
+      "source": { "type": "d1", "database": "YOUR-D1-DATABASE-ID", "table": "submissions" },
+      "columns": [
+        { "label": "Received", "from": "created_at", "type": "date" },
+        { "label": "Form", "from": "form_id" },
+        { "label": "Status", "from": "status", "type": "enum", "options": ["new", "read", "archived", "spam"] },
+        { "label": "Summary", "from": "summary" },
+        { "label": "Reply to", "from": "reply_email" },
+        { "label": "Spam reasons", "from": "spam_reasons", "type": "json" },
+        { "label": "Fields", "from": "data", "type": "json" },
+        { "label": "Not in config", "from": "extra", "type": "json" },
+        { "label": "Sent again", "from": "duplicate_count", "type": "number", "hidden": true },
+        { "label": "Turnstile", "from": "turnstile", "type": "enum", "options": ["passed", "off", "unverified"], "hidden": true },
+        { "label": "Consent", "from": "consent_version", "hidden": true },
+        { "label": "Id", "from": "id", "hidden": true }
+      ],
+      "actions": [
+        { "label": "Mark read", "set": { "status": "read" } },
+        { "label": "Archive", "set": { "status": "archived" } },
+        { "label": "Spam", "set": { "status": "spam" } },
+        { "label": "Back to inbox", "set": { "status": "new" } },
+        { "label": "Delete", "confirm": true, "delete": true }
+      ]
+    },
+    {
+      "id": "forms-failed",
+      "title": "Failed notifications",
+      "source": { "type": "d1", "database": "YOUR-D1-DATABASE-ID", "table": "deliveries" },
+      "columns": [
+        { "label": "Channel", "from": "channel" },
+        { "label": "Status", "from": "status", "type": "enum", "options": ["pending", "sending", "retry", "sent", "failed", "unknown", "skipped"] },
+        { "label": "Attempts", "from": "attempts", "type": "number" },
+        { "label": "Last error", "from": "last_error" },
+        { "label": "Sent", "from": "sent_at", "type": "date" },
+        { "label": "Submission", "from": "submission_id", "hidden": true }
+      ],
+      "actions": [{ "label": "Try again", "set": { "status": "pending", "next_attempt_at": 0 } }]
+    },
+    {
+      "id": "forms-files",
+      "title": "Form attachments",
+      "source": { "type": "d1", "database": "YOUR-D1-DATABASE-ID", "table": "files" },
+      "columns": [
+        { "label": "Name", "from": "name" },
+        { "label": "Type", "from": "content_type" },
+        { "label": "Bytes", "from": "size", "type": "number" },
+        { "label": "Received", "from": "created_at", "type": "date" },
+        { "label": "Submission", "from": "submission_id" }
+      ]
+    },
+    {
+      "id": "forms-daily",
+      "title": "Form counts per day",
+      "source": { "type": "d1", "database": "YOUR-D1-DATABASE-ID", "table": "daily_counts" },
+      "columns": [
+        { "label": "Day", "from": "day", "type": "date" },
+        { "label": "Form", "from": "form_id" },
+        { "label": "Kind", "from": "kind", "type": "enum", "options": ["ok", "spam", "spam_dropped", "spam_cap", "rate_limited", "invalid", "duplicate", "autoreply"] },
+        { "label": "Count", "from": "count", "type": "count" }
+      ]
+    }
+  ]
+}

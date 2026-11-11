@@ -1,0 +1,21 @@
+{
+  "$comment": "Your forms. Each key is a form id: its endpoint is https://<your worker>/f/<id>. Check with `npm run check`; the README lists every setting.",
+  "contact": {
+    "name": "Contact form",
+    "origins": ["https://example.com", "https://www.example.com"],
+    "fields": {
+      "name": { "type": "text", "required": true, "max": 200 },
+      "email": { "type": "email", "required": true },
+      "message": { "type": "textarea", "required": true, "max": 5000 },
+      "topic": { "type": "select", "options": ["Sales", "Support", "Other"] }
+    },
+    "replyTo": "email",
+    "redirect": null,
+    "notify": {
+      "email": ["you@example.com"],
+      "webhooks": []
+    },
+    "spam": { "turnstile": false, "honeypot": "website", "minSeconds": 3, "maxLinks": 2, "perHour": 5 },
+    "autoReply": null
+  }
+}

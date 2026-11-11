@@ -1,0 +1,9 @@
+/* perchlight-forms built-in pages. Restyle freely. */
+:root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fafafa; --muted: #666; --accent: #2563eb; }
+@media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #161618; --muted: #aaa; --accent: #7aa2ff; } }
+body { margin: 0; font: 17px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
+main { max-width: 34rem; margin: 12vh auto; padding: 0 16px; }
+h1 { font-size: 1.6rem; margin: 0 0 .75rem; }
+p, li { color: var(--fg); }
+.muted { color: var(--muted); font-size: .9rem; }
+a { color: var(--accent); }
