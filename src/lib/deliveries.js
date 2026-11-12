@@ -10,7 +10,7 @@ import { signedFileUrl, linkSecretOk } from "./links.js";
 import { settings } from "./settings.js";
 import { hmacHex } from "./crypto.js";
 import { sqlTime, utcDay } from "./http.js";
-import { spend, COST } from "./budget.js";
+import { spend, left, COST } from "./budget.js";
 
 export const BACKOFF_MINUTES = [1, 5, 30, 120, 720];
 export const WINDOW_MS = 24 * 3600_000;
@@ -230,6 +230,12 @@ export async function deliver(app, delivery, now = Date.now(), subCache = new Ma
   return outcome.status;
 }
 
+/** What one delivery costs from the budget: loading its submission is
+ *  charged only for the first delivery of that submission in a run. */
+function deliveryCost(d, cache) {
+  return COST.delivery + (d.channel === "autoreply" ? COST.autoreply : 0) + (cache.has(d.submission_id) ? 0 : COST.load);
+}
+
 /** Sends one submission's due deliveries (right after the reply). */
 export async function deliverSubmission(app, submissionId, now = Date.now()) {
   if (!spend(app.budget, COST.deliverySelect)) return [];
@@ -240,7 +246,7 @@ export async function deliverSubmission(app, submissionId, now = Date.now()) {
   const out = [];
   for (const d of results) {
     // Out of budget: the rest are sent by the next housekeeping run.
-    if (!spend(app.budget, COST.delivery)) break;
+    if (!spend(app.budget, deliveryCost(d, cache))) break;
     out.push(await deliver(app, d, now, cache));
   }
   return out;
@@ -248,6 +254,9 @@ export async function deliverSubmission(app, submissionId, now = Date.now()) {
 
 /** Sends up to `limit` due deliveries, oldest first. */
 export async function deliverDue(app, limit, now = Date.now()) {
+  // Not worth a select without room for at least one delivery after it.
+  if (left(app.budget) < COST.deliverySelect + COST.delivery + COST.load) return { tried: 0, sent: 0 };
+  spend(app.budget, COST.deliverySelect);
   const { results } = await app.env.DB.prepare(
     "SELECT * FROM deliveries WHERE status IN ('pending', 'retry') AND next_attempt_at <= ?1 ORDER BY next_attempt_at LIMIT ?2",
   ).bind(now, limit).all();
@@ -255,7 +264,7 @@ export async function deliverDue(app, limit, now = Date.now()) {
   let sent = 0;
   let tried = 0;
   for (const d of results) {
-    if (!spend(app.budget, COST.delivery)) break;
+    if (!spend(app.budget, deliveryCost(d, cache))) break;
     tried++;
     if ((await deliver(app, d, now, cache)) === "sent") sent++;
   }
@@ -292,4 +301,27 @@ export async function reviveSkipped(env, now = Date.now(), limit = 50) {
        LIMIT ?2)`,
   ).bind(now, limit).run();
   return r.meta.changes;
+}
+
+/** releaseStale + reviveSkipped in one D1 batch (one call). Returns how many were revived. */
+export async function releaseAndRevive(env, now = Date.now(), limit = 50) {
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE deliveries SET status = 'unknown', claimed_at = NULL,
+         last_error = 'the send was interrupted; it may or may not have gone out'
+       WHERE status = 'sending' AND claimed_at < ?1 AND channel = 'autoreply'`,
+    ).bind(now - STALE_MS),
+    env.DB.prepare(
+      `UPDATE deliveries SET status = 'retry', claimed_at = NULL, next_attempt_at = ?2
+       WHERE status = 'sending' AND claimed_at < ?1`,
+    ).bind(now - STALE_MS, now),
+    env.DB.prepare(
+      `UPDATE deliveries SET status = 'pending', next_attempt_at = ?1, attempts = 0, created_ms = ?1, last_error = NULL
+       WHERE rowid IN (
+         SELECT d.rowid FROM deliveries d JOIN submissions s ON s.id = d.submission_id
+         WHERE d.status = 'skipped' AND d.channel != 'autoreply' AND d.last_error IS NULL AND s.status != 'spam'
+         LIMIT ?2)`,
+    ).bind(now, limit),
+  ]);
+  return results[2].meta.changes;
 }

@@ -13,7 +13,7 @@ import { getSender } from "../lib/senders/index.js";
 import { ownerEmail } from "../lib/notify.js";
 import { settings } from "../lib/settings.js";
 import { countLater, isBlocked, block } from "../lib/counters.js";
-import { spend, COST } from "../lib/budget.js";
+import { spend, COST, deliveryReserve } from "../lib/budget.js";
 
 const DUPLICATE_WINDOW_MS = 10 * 60_000;
 // Fallback emails (sent only while D1 can't be written) per isolate per hour,
@@ -231,6 +231,7 @@ export async function submit(request, app, ctx, formId) {
   } catch (err) {
     // Never thank the visitor while dropping their file: say so instead.
     console.error(`R2: ${err instanceof Error ? err.message : String(err)}`);
+    countLater(env, ctx, form.id, "file_failed");
     await deleteObjects(env, fileRows);
     const s = settings(env);
     const message = `We couldn't save your attached file, so nothing was sent. Please try again later${s.fallbackContact ? ` or email ${s.fallbackContact}` : ""}.`;
@@ -306,7 +307,7 @@ export async function submit(request, app, ctx, formId) {
   if (!score.spam && channels.length) {
     // The post's own notifications are reserved first; the housekeeping run
     // started by success() only gets what's left of the request's budget.
-    const reserve = COST.deliverySelect + channels.length * COST.delivery;
+    const reserve = deliveryReserve(channels.length, channels.includes("autoreply"));
     const own = { left: spend(app.budget, reserve) ? reserve : 0 };
     ctx.waitUntil(
       deliverSubmission({ ...app, budget: own }, id, now).catch((err) => console.error(`notify ${id}: ${err instanceof Error ? err.stack : String(err)}`)),

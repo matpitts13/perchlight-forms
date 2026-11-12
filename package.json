@@ -9,7 +9,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
     "test": "vitest run",
-    "check": "node cli/check-forms.mjs"
+    "check": "node cli/check-forms.mjs",
+    "export": "node cli/export.mjs"
   },
   "engines": {
     "node": ">=22"

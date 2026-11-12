@@ -5,16 +5,23 @@
 // Every form post, admin API call and GET /tick may start a run after the
 // reply (ctx.waitUntil). A run starts only if the last one was at least
 // HOUSEKEEPING_MINUTES ago, decided by one conditional UPDATE on the state
-// table, so two requests at once can't both run it. Work per run is bounded
-// to stay well inside the free plan's 10 ms CPU and 50 subrequests:
-//   - up to DELIVERIES_PER_RUN due notifications, or
-//   - once an hour, instead, retention: up to RETENTION_BATCH expired
-//     submissions per folder (with their R2 files), old counters, and a
-//     100-object sweep of R2 for files whose row is gone.
-import { deliverDue, releaseStale, reviveSkipped } from "./deliveries.js";
+// table, so two requests at once can't both run it, and only if the
+// request's budget (src/lib/budget.js) has room for real work, so a post
+// whose own notifications used most of it never burns the slot for nothing.
+//
+// Each run, within what's left of the budget:
+//   1. releases stale claims and revives notifications whose submission left
+//      the spam folder (one batch);
+//   2. retries R2 deletes that failed earlier (pending_deletes);
+//   3. if retention is due (hourly) or part-done, runs its next steps, in
+//      order, as far as the budget allows, and saves where it got to: the
+//      inbox folder, the spam folder, old counters, the R2 orphan sweep.
+//      Retention goes before notifications, so it can't be starved;
+//   4. sends due notifications with what's left (at most DELIVERIES_PER_RUN).
+import { deliverDue, releaseAndRevive } from "./deliveries.js";
 import { settings } from "./settings.js";
 import { utcDay } from "./http.js";
-import { spend, COST } from "./budget.js";
+import { spend, left, COST, MIN_UNIT } from "./budget.js";
 
 export const DELIVERIES_PER_RUN = 4;
 export const RETENTION_BATCH = 40;
@@ -33,6 +40,8 @@ export function resetLocalThrottle() {
 export function maybeHousekeep(app, ctx, now = Date.now()) {
   // Skip even the D1 check if this isolate looked a moment ago.
   if (now - lastLocal < LOCAL_THROTTLE_MS) return;
+  // Not enough budget left for real work: don't look (and don't burn the slot).
+  if (left(app.budget) < COST.housekeepingBase + MIN_UNIT) return;
   lastLocal = now;
   ctx.waitUntil(
     runHousekeeping(app, { now }).catch((err) => console.error(`housekeeping: ${err instanceof Error ? err.stack : String(err)}`)),
@@ -42,82 +51,151 @@ export function maybeHousekeep(app, ctx, now = Date.now()) {
 /** Claims a timestamp row if it's older than intervalMs. */
 async function claimSlot(env, key, intervalMs, now) {
   const r = await env.DB.prepare(
-    "UPDATE state SET value = CAST(?2 AS TEXT) WHERE key = ?1 AND CAST(value AS INTEGER) <= ?3",
-  ).bind(key, now, now - intervalMs).run();
+    "UPDATE state SET value = ?2 WHERE key = ?1 AND CAST(value AS INTEGER) <= ?3",
+  ).bind(key, String(now), now - intervalMs).run();
   return r.meta.changes === 1;
 }
 
+/** The retention steps, in order, with their worst-case cost. */
+const STEPS = [
+  { name: "inbox", cost: COST.retentionFolder, run: (app, now, out) => retentionFolder(app, now, false, out) },
+  { name: "spam", cost: COST.retentionFolder, run: (app, now, out) => retentionFolder(app, now, true, out) },
+  { name: "counters", cost: COST.retentionCounters, run: (app, now) => retentionCounters(app.env, now) },
+  { name: "sweep", cost: COST.retentionSweep, run: async (app, now, out) => { if (app.env.FILES) out.orphans = await sweepOrphans(app.env, now); } },
+];
+
 /**
- * One housekeeping run. force: ignore the throttle (POST /api/housekeeping).
- * @returns {Promise<{ ran: boolean, deliveries?: object, revived?: number, retention?: object | null }>}
+ * One housekeeping run. force: ignore the throttle and run retention now
+ * (POST /api/housekeeping); the budget still applies.
+ * @returns {Promise<{ ran: boolean, budget?: true, revived?: number, pendingDeleted?: number,
+ *   retention?: { inbox: number, spam: number, orphans: number, steps: string[], complete: boolean } | null,
+ *   deliveries?: { tried: number, sent: number } }>}
  */
 export async function runHousekeeping(app, { now = Date.now(), force = false } = {}) {
   const { env } = app;
   const s = settings(env);
-  // Not enough left of this request's budget (a post's own notifications
-  // came first): the next request runs it.
-  if (!spend(app.budget, COST.housekeepingBase)) return { ran: false, budget: true };
+  if (left(app.budget) < COST.housekeepingBase + MIN_UNIT) return { ran: false, budget: true };
+  spend(app.budget, COST.housekeepingBase);
   if (force) {
-    await env.DB.prepare("UPDATE state SET value = CAST(?1 AS TEXT) WHERE key = 'last_run'").bind(now).run();
+    await env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'last_run'").bind(String(now)).run();
   } else if (!(await claimSlot(env, "last_run", s.housekeepingMinutes * 60_000, now))) {
     return { ran: false };
   }
-  await releaseStale(env, now);
-  const revived = await reviveSkipped(env, now);
-  // Retention (hourly) and deliveries take turns, so one run stays at about
-  // 25 D1 queries or fewer, even on top of a form post's own work.
+  const revived = await releaseAndRevive(env, now);
+  const { results: stateRows } = await env.DB.prepare(
+    "SELECT key, value FROM state WHERE key IN ('last_retention', 'retention_step')",
+  ).all();
+  const state = Object.fromEntries(stateRows.map((r) => [r.key, r.value]));
+
+  const pendingDeleted = left(app.budget) >= COST.pending ? (spend(app.budget, COST.pending), await retryPendingDeletes(env)) : 0;
+
   let retention = null;
-  let deliveries = null;
-  if ((app.budget?.left ?? Infinity) >= COST.retention && (force || (await claimSlot(env, "last_retention", RETENTION_EVERY_MS, now)))) {
-    spend(app.budget, COST.retention);
-    retention = await runRetention(app, now);
+  let step = Math.min(Math.max(Number(state.retention_step) || 0, 0), STEPS.length);
+  const due = force || step > 0 || now - (Number(state.last_retention) || 0) >= RETENTION_EVERY_MS;
+  if (due && left(app.budget) >= COST.stateSave + STEPS[step % STEPS.length].cost) {
+    spend(app.budget, COST.stateSave);
+    if (step >= STEPS.length) step = 0;
+    retention = { inbox: 0, spam: 0, orphans: 0, steps: [], complete: false };
+    while (step < STEPS.length && spend(app.budget, STEPS[step].cost)) {
+      await STEPS[step].run(app, now, retention);
+      retention.steps.push(STEPS[step].name);
+      step++;
+    }
+    retention.complete = step >= STEPS.length;
+    await env.DB.batch(
+      retention.complete
+        ? [
+            env.DB.prepare("UPDATE state SET value = '0' WHERE key = 'retention_step'"),
+            env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'last_retention'").bind(String(now)),
+          ]
+        : [env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'retention_step'").bind(String(step))],
+    );
   }
-  if (force || !retention) deliveries = await deliverDue(app, DELIVERIES_PER_RUN, now);
-  return { ran: true, deliveries, revived, retention };
+
+  const deliveries = await deliverDue(app, DELIVERIES_PER_RUN, now);
+  return { ran: true, revived, pendingDeleted, retention, deliveries };
 }
 
-/** Deletes R2 objects; a failure is logged, not thrown, so the rest of the
- *  clean-up goes on. Anything left is found again by the orphan sweep. */
+/**
+ * Deletes R2 objects. Returns the keys that couldn't be deleted (R2 down),
+ * which the caller records in pending_deletes so the next run retries them.
+ */
 async function deleteObjects(env, keys) {
+  if (!keys.length || !env.FILES) return keys.length && !env.FILES ? keys : [];
   try {
     await env.FILES.delete(keys);
+    return [];
   } catch (err) {
-    console.error(`R2 delete of ${keys.length} object(s): ${err instanceof Error ? err.message : String(err)}; the orphan sweep will retry`);
+    console.error(`R2 delete of ${keys.length} object(s): ${err instanceof Error ? err.message : String(err)}; kept in pending_deletes for the next run`);
+    return keys;
   }
 }
 
-/** Deletes submissions (R2 files first, then rows; files and deliveries cascade). */
+async function recordPending(env, keys, now = Date.now()) {
+  for (let i = 0; i < keys.length; i += 45) {
+    const chunk = keys.slice(i, i + 45); // 2 parameters each: under D1's 100
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO pending_deletes (r2_key, created_ms) VALUES ${chunk.map((_, j) => `(?${2 * j + 1}, ?${2 * j + 2})`).join(", ")}`,
+    ).bind(...chunk.flatMap((k) => [k, now])).run();
+  }
+}
+
+/** Retries R2 deletes that failed before. Returns how many went through. */
+export async function retryPendingDeletes(env) {
+  const { results } = await env.DB.prepare("SELECT r2_key FROM pending_deletes ORDER BY created_ms LIMIT ?1").bind(IN_CHUNK).all();
+  if (!results.length || !env.FILES) return 0;
+  const keys = results.map((r) => r.r2_key);
+  if ((await deleteObjects(env, keys)).length) return 0;
+  await env.DB.prepare(`DELETE FROM pending_deletes WHERE r2_key IN (${keys.map((_, j) => `?${j + 1}`).join(", ")})`).bind(...keys).run();
+  return keys.length;
+}
+
+/**
+ * Deletes submissions: R2 files first, then rows (files and deliveries
+ * cascade). Files R2 couldn't delete are recorded in pending_deletes.
+ * @returns {Promise<{ deleted: number, filesPending: number }>}
+ */
 export async function deleteSubmissions(env, ids) {
   let deleted = 0;
+  let filesPending = 0;
   for (let i = 0; i < ids.length; i += IN_CHUNK) {
     const chunk = ids.slice(i, i + IN_CHUNK);
     const marks = chunk.map((_, j) => `?${j + 1}`).join(", ");
     const { results } = await env.DB.prepare(`SELECT r2_key FROM files WHERE submission_id IN (${marks})`).bind(...chunk).all();
-    if (results.length && env.FILES) await deleteObjects(env, results.map((r) => r.r2_key));
+    const failed = await deleteObjects(env, results.map((r) => r.r2_key));
+    if (failed.length) {
+      await recordPending(env, failed);
+      filesPending += failed.length;
+    }
     // RETURNING, not meta.changes: changes also counts the cascaded file and delivery rows.
     const r = await env.DB.prepare(`DELETE FROM submissions WHERE id IN (${marks}) RETURNING id`).bind(...chunk).all();
     deleted += r.results.length;
   }
-  return deleted;
+  return { deleted, filesPending };
 }
 
-export async function runRetention(app, now = Date.now()) {
+/** Number of R2 objects still waiting to be deleted. */
+export async function pendingDeleteCount(env) {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM pending_deletes").first();
+  return row?.n ?? 0;
+}
+
+async function retentionFolder(app, now, spam, out) {
   const { env } = app;
   const s = settings(env);
   const DAY = 86400_000;
-  const out = { inbox: 0, spam: 0, orphans: 0 };
+  const days = spam ? s.spamRetentionDays : s.retentionDays;
+  if (!spam && days === 0) return; // RETENTION_DAYS=0: keep the inbox until deleted
+  const { results } = await env.DB.prepare(
+    `SELECT id FROM submissions WHERE status ${spam ? "=" : "!="} 'spam' AND created_ms < ?1 ORDER BY created_ms LIMIT ?2`,
+  ).bind(now - days * DAY, RETENTION_BATCH).all();
+  if (!results.length) return;
+  const r = await deleteSubmissions(env, results.map((x) => x.id));
+  out[spam ? "spam" : "inbox"] += r.deleted;
+}
 
-  if (s.retentionDays > 0) {
-    const { results } = await env.DB.prepare(
-      "SELECT id FROM submissions WHERE status != 'spam' AND created_ms < ?1 ORDER BY created_ms LIMIT ?2",
-    ).bind(now - s.retentionDays * DAY, RETENTION_BATCH).all();
-    out.inbox = await deleteSubmissions(env, results.map((r) => r.id));
-  }
-  const { results: spam } = await env.DB.prepare(
-    "SELECT id FROM submissions WHERE status = 'spam' AND created_ms < ?1 ORDER BY created_ms LIMIT ?2",
-  ).bind(now - s.spamRetentionDays * DAY, RETENTION_BATCH).all();
-  out.spam = await deleteSubmissions(env, spam.map((r) => r.id));
-
+async function retentionCounters(env, now) {
+  const DAY = 86400_000;
   const hourCut = new Date(now - 48 * 3600_000).toISOString().slice(0, 13);
   await env.DB.batch([
     env.DB.prepare("DELETE FROM rate_counters WHERE rowid IN (SELECT rowid FROM rate_counters WHERE hour < ?1 LIMIT 1000)").bind(hourCut),
@@ -128,9 +206,6 @@ export async function runRetention(app, now = Date.now()) {
     ).bind(now - 90 * DAY),
     env.DB.prepare("DELETE FROM daily_counts WHERE rowid IN (SELECT rowid FROM daily_counts WHERE day < ?1 LIMIT 1000)").bind(utcDay(now - 400 * DAY)),
   ]);
-
-  if (env.FILES) out.orphans = await sweepOrphans(env, now);
-  return out;
 }
 
 /**
@@ -151,6 +226,7 @@ async function sweepOrphans(env, now) {
     const known = new Set(results.map((r) => r.r2_key));
     orphans.push(...chunk.filter((k) => !known.has(k)));
   }
+  // Orphans R2 refuses to delete now are simply found again on a later sweep.
   if (orphans.length) await deleteObjects(env, orphans);
   await env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'r2_cursor'").bind(listed.truncated ? listed.cursor : "").run();
   return orphans.length;

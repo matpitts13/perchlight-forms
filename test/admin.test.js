@@ -100,7 +100,7 @@ describe("forms and submissions", () => {
     expect(list).toHaveLength(3);
     expect(list.find((r) => r.form_id === "jobs").files).toEqual(["cv.pdf"]);
     const del = await api("DELETE", "submissions?email=person@example.org");
-    expect(del.data).toEqual({ ok: true, deleted: 3, more: false });
+    expect(del.data).toEqual({ ok: true, deleted: 3, filesPending: 0, more: false });
     expect(await rows("SELECT reply_email FROM submissions")).toEqual([{ reply_email: "someone-else@example.org" }]);
     expect((await env.FILES.list()).objects).toHaveLength(0);
   });
@@ -130,7 +130,7 @@ describe("export", () => {
     for (let i = 0; i < 100; i++) {
       await env.DB.prepare(
         "INSERT INTO submissions (id, form_id, created_at, created_ms, data, content_hash) VALUES (?1, 'contact', '2026-01-01 00:00:00', ?2, '{}', 'h')",
-      ).bind(`sub_${String(i).padStart(16, "a").replace(/\d/g, (d) => "abcdefghjk"[d])}`, 1000 + i).run();
+      ).bind(`sub_${String(i).padStart(16, "a").replace(/\d/g, (d) => "abcdefghjk"[d])}`, Date.now() - 10_000_000 + i).run(); // recent, so retention keeps them
     }
     const res = await call("/api/export?format=json", { headers: { Authorization: "Bearer test-admin-token-0123456789" } });
     const list = await res.json();

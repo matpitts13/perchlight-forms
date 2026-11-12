@@ -9,24 +9,50 @@
 
 export const SUBREQUEST_BUDGET = 45;
 
-/** Upper estimates, counted by hand from the code. */
+/** Worst cases, counted by hand from the code. */
 export const COST = {
-  // rate limit, duplicate check, spam-cap slot, the batch, counters flush
+  // a form post: rate limit, duplicate check, spam-cap slot, the batch, a counters flush
   post: 6,
   // per file: R2 put
   file: 1,
-  // deliverSubmission's own select
+  // sending: the select of due rows; loading a submission (row + files, once
+  // per submission); per delivery: claim, the send, finish; an auto-reply
+  // adds its two caps and a possible release
   deliverySelect: 1,
-  // claim, load submission (2), finish, the send; an auto-reply adds 3
-  delivery: 8,
-  // throttle claim, stale release, revive, retention claim, due select
-  housekeepingBase: 5,
-  // two folders x (select + files select + R2 delete + delete), counters batch, R2 sweep (state, list, select, delete, update)
-  retention: 14,
+  load: 2,
+  delivery: 3,
+  autoreply: 3,
+  // housekeeping: throttle claim, stale release + revive (one batch), state read
+  housekeepingBase: 3,
+  // pending R2 deletes: select, R2 delete, delete rows
+  pending: 3,
+  // one retention folder (inbox or spam): select ids, select file keys, R2
+  // delete, delete rows, and on an R2 failure the pending-delete insert
+  retentionFolder: 5,
+  // old counters, hashes and delivery rows: one batch
+  retentionCounters: 1,
+  // R2 orphan sweep: state read, list, two IN (...) selects for 100 keys, R2 delete, cursor update
+  retentionSweep: 6,
+  // saving retention progress
+  stateSave: 1,
 };
+
+/** The smallest piece of useful work a housekeeping run can do (one
+ *  delivery, or one retention folder). A run doesn't even claim its slot
+ *  with less than base + this left. */
+export const MIN_UNIT = Math.max(COST.delivery + COST.load, COST.retentionFolder);
+
+/** A post's own notifications: what submit.js reserves before replying. */
+export function deliveryReserve(channels, autoReply) {
+  return COST.deliverySelect + COST.load + channels * COST.delivery + (autoReply ? COST.autoreply : 0);
+}
 
 export function newBudget(total = SUBREQUEST_BUDGET) {
   return { left: total };
+}
+
+export function left(budget) {
+  return budget ? budget.left : Infinity;
 }
 
 /** Takes n from the budget if it's there. */

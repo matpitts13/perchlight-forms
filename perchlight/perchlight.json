@@ -61,7 +61,7 @@
       "columns": [
         { "label": "Day", "from": "day", "type": "date" },
         { "label": "Form", "from": "form_id" },
-        { "label": "Kind", "from": "kind", "type": "enum", "options": ["ok", "spam", "spam_dropped", "spam_cap", "rate_limited", "invalid", "duplicate", "autoreply"] },
+        { "label": "Kind", "from": "kind", "type": "enum", "options": ["ok", "spam", "spam_dropped", "spam_cap", "rate_limited", "invalid", "duplicate", "autoreply", "file_failed"] },
         { "label": "Count", "from": "count", "type": "count" }
       ]
     }

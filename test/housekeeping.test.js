@@ -70,10 +70,9 @@ describe("lazy housekeeping (no cron)", () => {
     ]);
     const r = await runHousekeeping(makeApp({ EMAIL: fakeEmail().binding }), { now: Date.now() + MIN });
     expect(r.ran).toBe(true);
-    // First run of the hour does retention instead; the next one sends.
-    expect(r.deliveries).toBeNull();
-    const r2 = await runHousekeeping(makeApp({ EMAIL: fakeEmail().binding }), { now: Date.now() + 10 * MIN });
-    expect(r2.deliveries.tried).toBe(DELIVERIES_PER_RUN);
+    // Retention goes first, then notifications with what's left of the budget.
+    expect(r.retention.complete).toBe(true);
+    expect(r.deliveries.tried).toBe(DELIVERIES_PER_RUN);
   });
 });
 

@@ -4,7 +4,8 @@
 import { json, fail, readJson, sqlTime, utcDay } from "../lib/http.js";
 import { safeEqual, isId, randomId } from "../lib/crypto.js";
 import { loadSubmission, deliverSubmission, deliver, sendWebhook } from "../lib/deliveries.js";
-import { deleteSubmissions, maybeHousekeep, runHousekeeping } from "../lib/housekeeping.js";
+import { deleteSubmissions, maybeHousekeep, runHousekeeping, pendingDeleteCount } from "../lib/housekeeping.js";
+import { spend } from "../lib/budget.js";
 import { signedFileUrl, linkSecretOk } from "../lib/links.js";
 import { getSender, canAutoReply, providerName } from "../lib/senders/index.js";
 import { ownerEmail } from "../lib/notify.js";
@@ -14,6 +15,7 @@ import { settings } from "../lib/settings.js";
 
 const PAGE_MAX = 200;
 const EXPORT_PAGE = 90; // file names are fetched with one IN (...) per page: under D1's 100 parameters
+const EXPORT_MAX = 1000; // rows per export request: 1 + 2 x 12 D1 calls, inside the request budget
 const STATUSES = ["new", "read", "archived", "spam"];
 const MIN_TOKEN = 16;
 
@@ -42,7 +44,7 @@ export async function handleAdmin(request, app, ctx, path) {
     else if (m === "GET") res = await getSubmission(env, parts[1]);
     else if (m === "PATCH") res = await patchSubmission(request, app, ctx, parts[1]);
     else if (m === "DELETE") res = await deleteOne(env, parts[1]);
-  } else if (m === "GET" && path === "export") res = exportSubmissions(app, q);
+  } else if (m === "GET" && path === "export") res = await exportSubmissions(app, q);
   else if (parts[0] === "files" && isId("fil", parts[1] ?? "")) {
     if (m === "GET" && parts.length === 2) res = env.FILES ? await streamFile(env, parts[1], () => fail(404, "No such file.")) : fail(404, "No such file.");
     else if (m === "POST" && parts[2] === "link" && parts.length === 3) res = await makeLink(app, parts[1]);
@@ -87,6 +89,9 @@ async function listForms(app) {
     mailProvider: providerName(env),
     spamStoredToday: spamCap,
     spamDailyCap: settings(env).spamDailyCap,
+    countsNote:
+      "today's ok, spam and autoreply counts are exact; invalid, rate_limited, spam_dropped, duplicate and file_failed are approximate (held in memory and written once a minute per Worker instance, so an evicted instance's last minute can be lost).",
+    filesPendingDelete: await pendingDeleteCount(env),
     housekeeping: { lastRun: state.last_run ?? null, lastRetention: state.last_retention ?? null },
   });
 }
@@ -212,8 +217,16 @@ async function patchSubmission(request, app, ctx, id) {
 }
 
 async function deleteOne(env, id) {
-  const n = await deleteSubmissions(env, [id]);
-  return n ? json({ ok: true, deleted: n }) : fail(404, "No such submission.");
+  const r = await deleteSubmissions(env, [id]);
+  if (!r.deleted) return fail(404, "No such submission.");
+  return json({ ok: true, deleted: r.deleted, filesPending: r.filesPending, ...pendingNote(r.filesPending) });
+}
+
+/** Erasure isn't finished while R2 still holds files: say so. */
+function pendingNote(n) {
+  return n
+    ? { warning: `${n} attached file(s) couldn't be deleted from R2 yet. They're queued and retried by every housekeeping run (POST /api/housekeeping to retry now).` }
+    : {};
 }
 
 /** Delete on request (GDPR Art. 17): every submission whose reply address matches. */
@@ -223,9 +236,9 @@ async function deleteByEmail(env, q) {
   const LIMIT = 450;
   const { results } = await env.DB.prepare("SELECT id FROM submissions WHERE reply_email = ?1 LIMIT ?2").bind(email, LIMIT + 1).all();
   const ids = results.slice(0, LIMIT).map((r) => r.id);
-  const deleted = await deleteSubmissions(env, ids);
-  console.log(`delete on request: ${deleted} submission(s) at ${sqlTime()}`); // a count and time only
-  return json({ ok: true, deleted, more: results.length > LIMIT });
+  const { deleted, filesPending } = await deleteSubmissions(env, ids);
+  console.log(`delete on request: ${deleted} submission(s), ${filesPending} file(s) pending, at ${sqlTime()}`); // counts and time only
+  return json({ ok: true, deleted, filesPending, more: results.length > LIMIT, ...pendingNote(filesPending) });
 }
 
 /** Spreadsheets run cells starting with these as formulas. */
@@ -235,7 +248,14 @@ export function csvCell(v) {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-function exportSubmissions(app, q) {
+/**
+ * One page of an export: at most EXPORT_MAX rows (default and limit 1,000),
+ * so a request stays inside the subrequest budget. When there's more, the
+ * X-Next-Cursor header (and Link: rel="next") gives the next page's cursor;
+ * cli/export.mjs follows it. A database error mid-stream aborts the response
+ * (the client sees a failed download), never a cleanly ended, shorter file.
+ */
+async function exportSubmissions(app, q) {
   const { env, forms } = app;
   const format = q.get("format") ?? "csv";
   if (!["csv", "json"].includes(format)) return fail(400, 'format must be "csv" or "json"');
@@ -243,67 +263,95 @@ function exportSubmissions(app, q) {
   if (f.error) return fail(400, f.error);
   const form = q.get("form") ? forms.get(q.get("form"))?.form : null;
   if (q.get("form") && !form) return fail(404, "No such form in forms.json.");
+  const limit = Math.min(Math.max(Number.parseInt(q.get("limit") ?? String(EXPORT_MAX), 10) || EXPORT_MAX, 1), EXPORT_MAX);
+  let start = null;
+  if (q.get("cursor")) {
+    start = decodeCursor(q.get("cursor"));
+    if (!start) return fail(400, "That cursor isn't valid.");
+  }
   const fields = form ? Object.values(form.fields).filter((x) => x.type !== "file") : [];
   const header = form
     ? ["id", "created_at", "status", "spam_reasons", ...fields.map((x) => x.name), "files", "extra"]
     : ["id", "created_at", "form", "status", "spam_reasons", "data", "files", "extra"];
 
+  const query = (cursor, tail, tailParams) => {
+    const where = [...f.where];
+    const params = [...f.params];
+    if (cursor) {
+      params.push(cursor.ms, cursor.id);
+      where.push(`(created_ms < ?${params.length - 1} OR (created_ms = ?${params.length - 1} AND id < ?${params.length}))`);
+    }
+    const marks = tailParams.map((v) => {
+      params.push(v);
+      return `?${params.length}`;
+    });
+    return env.DB.prepare(`${tail.select} ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY created_ms DESC, id DESC ${tail.rest(marks)}`).bind(...params);
+  };
+
+  // Is there a next page? One query, before the headers go out.
+  spend(app.budget, 1 + 2 * Math.ceil(limit / EXPORT_PAGE));
+  const ahead = await query(start, { select: "SELECT created_ms, id FROM submissions", rest: (m) => `LIMIT 2 OFFSET ${m[0]}` }, [limit - 1]).all();
+  const next = ahead.results.length === 2 ? encodeCursor(ahead.results[0]) : null;
+
   const enc = new TextEncoder();
-  let cursor = null;
+  let cursor = start;
+  let sent = 0;
   let first = true;
-  let done = false;
   const stream = new ReadableStream({
     async pull(controller) {
-      if (done) return;
-      if (first) controller.enqueue(enc.encode(format === "csv" ? `﻿${header.map(csvCell).join(",")}\r\n` : "["));
-      const where = [...f.where];
-      const params = [...f.params];
-      if (cursor) {
-        params.push(cursor.ms, cursor.id);
-        where.push(`(created_ms < ?${params.length - 1} OR (created_ms = ?${params.length - 1} AND id < ?${params.length}))`);
-      }
-      params.push(EXPORT_PAGE);
-      const { results } = await env.DB.prepare(
-        `SELECT * FROM submissions ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY created_ms DESC, id DESC LIMIT ?${params.length}`,
-      ).bind(...params).all();
-      const names = new Map();
-      if (results.length) {
-        const { results: files } = await env.DB.prepare(
-          `SELECT submission_id, name FROM files WHERE submission_id IN (${results.map((_, i) => `?${i + 1}`).join(", ")}) ORDER BY created_at`,
-        ).bind(...results.map((r) => r.id)).all();
-        for (const x of files) names.set(x.submission_id, [...(names.get(x.submission_id) ?? []), x.name]);
-      }
-      let chunk = "";
-      for (const raw of results) {
-        const r = rowOut(raw);
-        const fileNames = names.get(r.id) ?? [];
-        if (format === "json") {
-          chunk += `${first ? "" : ","}\n${JSON.stringify({ ...r, files: fileNames })}`;
-        } else {
-          const cells = form
-            ? [r.id, r.created_at, r.status, r.spam_reasons, ...fields.map((x) => r.data[x.name]), fileNames, r.extra]
-            : [r.id, r.created_at, r.form_id, r.status, r.spam_reasons, r.data, fileNames, r.extra];
-          chunk += `${cells.map(csvCell).join(",")}\r\n`;
+      try {
+        let chunk = "";
+        if (first && sent === 0) chunk += format === "csv" ? `\uFEFF${header.map(csvCell).join(",")}\r\n` : "[";
+        const size = Math.min(EXPORT_PAGE, limit - sent);
+        const { results } = size > 0
+          ? await query(cursor, { select: "SELECT * FROM submissions", rest: (m) => `LIMIT ${m[0]}` }, [size]).all()
+          : { results: [] };
+        const names = new Map();
+        if (results.length) {
+          const { results: files } = await env.DB.prepare(
+            `SELECT submission_id, name FROM files WHERE submission_id IN (${results.map((_, i) => `?${i + 1}`).join(", ")}) ORDER BY created_at`,
+          ).bind(...results.map((r) => r.id)).all();
+          for (const x of files) names.set(x.submission_id, [...(names.get(x.submission_id) ?? []), x.name]);
+        }
+        for (const raw of results) {
+          const r = rowOut(raw);
+          const fileNames = names.get(r.id) ?? [];
+          if (format === "json") chunk += `${first ? "" : ","}\n${JSON.stringify({ ...r, files: fileNames })}`;
+          else {
+            const cells = form
+              ? [r.id, r.created_at, r.status, r.spam_reasons, ...fields.map((x) => r.data[x.name]), fileNames, r.extra]
+              : [r.id, r.created_at, r.form_id, r.status, r.spam_reasons, r.data, fileNames, r.extra];
+            chunk += `${cells.map(csvCell).join(",")}\r\n`;
+          }
+          first = false;
         }
         first = false;
+        sent += results.length;
+        const done = results.length < size || sent >= limit;
+        if (!done) cursor = { ms: results[results.length - 1].created_ms, id: results[results.length - 1].id };
+        if (done && format === "json") chunk += "\n]\n";
+        if (chunk) controller.enqueue(enc.encode(chunk));
+        if (done) controller.close();
+      } catch (err) {
+        console.error(`export: ${err instanceof Error ? err.message : String(err)}`);
+        controller.error(err); // an aborted download, not a silently short file
       }
-      first = false;
-      if (results.length < EXPORT_PAGE) {
-        if (format === "json") chunk += "\n]\n";
-        done = true;
-      } else cursor = { ms: results[results.length - 1].created_ms, id: results[results.length - 1].id };
-      if (chunk) controller.enqueue(enc.encode(chunk));
-      if (done) controller.close();
     },
   });
   const name = `${form ? form.id : "submissions"}-${utcDay()}.${format}`;
-  return new Response(stream, {
-    headers: {
-      "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "application/json; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${name}"`,
-      "Cache-Control": "no-store",
-    },
-  });
+  const headers = {
+    "Content-Type": format === "csv" ? "text/csv; charset=utf-8" : "application/json; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${name}"`,
+    "Cache-Control": "no-store",
+    "Access-Control-Expose-Headers": "X-Next-Cursor",
+  };
+  if (next) {
+    const u = new URL(q.toString() ? `?${q.toString()}` : "?", "https://x/api/export");
+    u.searchParams.set("cursor", next);
+    headers["X-Next-Cursor"] = next;
+    headers.Link = `</api/export${u.search}>; rel="next"`;
+  }
+  return new Response(stream, { headers });
 }
 
 async function makeLink(app, fileId) {

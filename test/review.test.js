@@ -100,7 +100,7 @@ describe("4. subrequest budget", () => {
     await env.DB.prepare("UPDATE deliveries SET next_attempt_at = 0, status = 'pending'").run();
     const [sub] = await rows("SELECT id FROM submissions");
     const email = fakeEmail();
-    const app = { ...makeApp({ EMAIL: email.binding }), budget: { left: 9 } }; // the select + one delivery
+    const app = { ...makeApp({ EMAIL: email.binding }), budget: { left: 6 } }; // the select + one delivery (3 + loading the submission 2)
     const out = await deliverSubmission(app, sub.id);
     expect(out).toHaveLength(1);
     expect((await rows("SELECT status FROM deliveries WHERE status = 'pending'"))).toHaveLength(1);

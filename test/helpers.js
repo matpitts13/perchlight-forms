@@ -54,6 +54,13 @@ export const TEST_FORMS = {
     spam: { turnstile: true, perHour: 0 },
     autoReply: { subject: "Thanks, we got your message", text: "We'll reply within two working days.", dailyCap: 2 },
   },
+  busy: {
+    name: "Busy",
+    origins: [SITE],
+    fields: { email: { type: "email", required: true }, message: { type: "textarea" }, cv: { type: "file", maxMB: 0.1, types: ["pdf"], maxCount: 5 } },
+    notify: { email: ["a@example.com", "b@example.com", "c@example.com"], webhooks: ["discord"] },
+    spam: { perHour: 0 },
+  },
   broken: {
     name: "Broken",
     origins: [SITE],
@@ -181,7 +188,7 @@ export async function resetAll() {
   resetBlocked();
   resetFallbackCap();
   await env.DB.batch(
-    ["files", "deliveries", "submissions", "rate_counters", "daily_counts", "autoreply_sent"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)),
+    ["files", "deliveries", "submissions", "rate_counters", "daily_counts", "autoreply_sent", "pending_deletes"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)),
   );
   await env.DB.prepare("UPDATE state SET value = CASE key WHEN 'r2_cursor' THEN '' ELSE '0' END").run();
   let cursor;

@@ -217,7 +217,7 @@ Delivery rows are created in the same transaction as the submission: one per cha
 Decided by open question 6; details in [ADR 0001](adr/0001-lazy-housekeeping-no-cron.md).
 
 - **When:** after the reply to a form post, an admin API call or `GET /tick`, via `ctx.waitUntil`. A run starts only if the last one was at least `HOUSEKEEPING_MINUTES` (default 5) ago, decided by one conditional `UPDATE` of a timestamp row in the `state` table, so concurrent requests can't both run it. Each isolate also skips the D1 check for 15 seconds after looking.
-- **What, bounded:** release stale claims; send notifications whose submission left the spam folder; then either up to 4 due notifications or, at most once an hour instead, retention (40 submissions per folder with their R2 files, old counters, a 100-object R2 orphan sweep). About 25 D1 queries at most, so a run on top of a form post stays under the free plan's 50 per invocation; CPU work is small (JSON, HMAC).
+- **What, bounded:** a run starts only if the request has budget left for real work (so a busy post never burns the slot), then: retries R2 deletes that failed; if retention is due (hourly) or part-done, runs its next steps (inbox folder, spam folder, old counters, R2 orphan sweep) as far as the budget allows and saves where it got to, so it continues on the next run and can't be starved; then sends due notifications (up to 4) with what's left. Tested: on a form with 4 channels and 5 files, posts alone (no admin calls, no `/tick`) finish retention and the retries within 3 posts 5 minutes apart.
 - **Trade-off:** a quiet site retries and cleans up only when the Worker is woken. Nothing is lost, but an alert can be late. The desktop app talks to D1, not the Worker, so it doesn't wake it. A free uptime monitor on `/tick` (288 requests a day at 5 minutes, no cron trigger) keeps a quiet site on schedule. `POST /api/housekeeping` runs it now.
 
 ### Auto-reply (opt-in)
@@ -260,8 +260,8 @@ Everything under `/api/`, with `Authorization: Bearer <ADMIN_TOKEN>` (constant-t
 | `GET /api/submissions?form=&status=&since=&limit=&cursor=` | List, newest first, at most 200 per page. |
 | `GET /api/submissions/:id` | One submission with its files and deliveries. |
 | `PATCH /api/submissions/:id` | `{ "status": "read" | "new" | "archived" | "spam" | "ok" }`. `ok` = not spam: moves to the inbox and sends skipped notifications. |
-| `DELETE /api/submissions/:id` | Deletes it, its files and deliveries. |
-| `DELETE /api/submissions?email=` | Delete on request (see above). |
+| `DELETE /api/submissions/:id` | Deletes it, its files and deliveries; reports `filesPending` if R2 couldn't delete files yet (kept in `pending_deletes`, retried every housekeeping run). |
+| `DELETE /api/submissions?email=` | Delete on request (see above), with `filesPending` as above. |
 | `GET /api/export?form=&format=csv|json&status=&since=&email=` | CSV: UTF-8 with BOM (so Excel reads accents), one column per configured field plus id, time, status, spam reasons, file names; values starting with `=`, `+`, `-`, `@`, tab or CR are prefixed with `'` so spreadsheets don't run them as formulas. JSON: the rows as stored. Streamed, so large exports don't hit memory limits. |
 | `GET /api/files/:id` · `POST /api/files/:id/link` | Download, or make a 15-minute signed link. |
 | `GET /api/deliveries?status=failed` · `POST /api/deliveries/:id/retry` | Failed notifications. |
@@ -273,9 +273,10 @@ Everything under `/api/`, with `Authorization: Bearer <ADMIN_TOKEN>` (constant-t
 - `files`: `id`, `submission_id`, `field`, `name`, `content_type`, `size`, `sha256`, `r2_key`, `created_at`.
 - `deliveries`: `id`, `submission_id`, `channel`, `status` (`pending` | `sending` | `retry` | `sent` | `failed` | `unknown` | `skipped`), `attempts`, `next_attempt_at`, `claimed_at`, `sent_at`, `last_error`. Unique on `(submission_id, channel)`; index `(status, next_attempt_at)`.
 - `rate_counters`: `key`, `hour`, `count`. Primary key `(key, hour)`.
-- `daily_counts`: `day`, `form_id`, `kind` (`ok` | `spam` | `spam_dropped` | `rate_limited` | `invalid` | `duplicate` | `autoreply`), `count`. The row `form_id = '*'`, `kind = 'spam_cap'` is the deployment-wide count of stored spam for `SPAM_DAILY_CAP`. `invalid`, `rate_limited`, `spam_dropped` and `duplicate` are buffered in memory and written once a minute per isolate.
+- `daily_counts`: `day`, `form_id`, `kind` (`ok` | `spam` | `spam_dropped` | `rate_limited` | `invalid` | `duplicate` | `autoreply`), `count`. The row `form_id = '*'`, `kind = 'spam_cap'` is the deployment-wide count of stored spam for `SPAM_DAILY_CAP`. `invalid`, `rate_limited`, `spam_dropped`, `duplicate` and `file_failed` are buffered in memory and written once a minute per isolate, so they're approximate.
 - `autoreply_sent`: `email_hash` (HMAC of the address with `IP_SALT`, primary key), `sent_ms`. Deleted after 2 days.
-- `state`: `key`, `value`: the housekeeping timestamps (`last_run`, `last_retention`) and the R2 sweep's `r2_cursor`.
+- `state`: `key`, `value`: the housekeeping timestamps (`last_run`, `last_retention`), the next retention step (`retention_step`) and the R2 sweep's `r2_cursor`.
+- `pending_deletes`: `r2_key`, `created_ms`: R2 objects whose row is gone but whose delete failed; retried every housekeeping run.
 
 Foreign keys cascade from `submissions` to `files` and `deliveries`; R2 objects are deleted by the Worker before the row.
 
@@ -312,7 +313,7 @@ Measured during the build; first estimates:
 | Worker requests (limit 100,000/day) | 0 (288 if you ping `/tick` every 5 minutes) | 1 (+1 preflight for JSON `fetch`; the thank-you page is your own site or a static asset) | about 2,300 (2.3%) |
 | D1 rows written (limit 100,000/day) | 0 without traffic; at most 1 per housekeeping run with no work | about 15 (submission, deliveries and their updates, counters, indexes) | about 15,000 (15%) |
 | D1 rows read (limit 5,000,000/day) | about 1,000 | about 20 | about 21,000 (0.4%) |
-| Subrequests (limit 50/request) | about 20 per housekeeping run | about 6 D1 calls + 1 per file + 1 Turnstile, then about 8 per channel (unverified whether binding calls count; assumed yes, budget 45) | — |
+| Subrequests (limit 50/request) | at most about 25 per housekeeping run | about 6 D1 calls + 1 per file + 1 Turnstile, then 3 per channel + 2 to load the submission (+3 for an auto-reply); unverified whether binding calls count, assumed yes, budget 45 | — |
 | R2 (if used; 10 GB, 1M Class A/month) | 0 | 1 write per file | e.g. 20 CVs a day of 1 MB: 0.6 GB/month, about 0.1% of Class A |
 
 So on Free, writes are the limit that would bind first, at roughly 6,000 submissions a day. Spam is capped (`SPAM_DAILY_CAP`) so a bot flood can't use the writes up.
@@ -357,7 +358,8 @@ The owner approved the design with these answers:
 - **R2 failure (after review):** the visitor gets a 503 saying the attachment wasn't saved; nothing is stored. A D1 constraint error is retried once with fresh ids instead of being treated as an outage.
 - **Flood writes (after review):** refused-post counters are buffered per isolate (one batch a minute), and a network over its hourly limit is refused from memory. Each post from a new network still writes its rate counter.
 - **Also added after review:** the duplicate hash includes attachments (field, size, SHA-256); optional `spam.turnstileAction`; numbers that don't fit a double are refused; `WEBHOOK_SECRET` needs 16+ characters; a switched-off form still sends CORS headers to its origins; the config is checked once per isolate.
-- `daily_counts` gained the kinds `duplicate`, `autoreply` and the `'*'`/`spam_cap` row; `autoreply_sent` is `(email_hash, sent_ms)`.
+- `daily_counts` gained the kinds `duplicate`, `autoreply`, `file_failed` and the `'*'`/`spam_cap` row; `autoreply_sent` is `(email_hash, sent_ms)`.
+- **After the second review:** a housekeeping run only claims its slot when the request has budget for real work; retention runs in steps saved in `state.retention_step` and goes before notifications, so neither is starved; R2 deletes that fail during erasure or retention are kept in a new `pending_deletes` table (migration 0002) and retried every run, and the admin API reports `filesPending`; exports are paged at 1,000 rows with `X-Next-Cursor` (`cli/export.mjs` joins pages) and abort on a mid-stream error; the refused-post counters are marked approximate; R2 failures are counted (`file_failed`).
 
 ## Couldn't confirm (2026-11-10)
 

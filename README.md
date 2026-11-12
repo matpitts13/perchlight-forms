@@ -157,12 +157,14 @@ The first sends a sample notification through every channel of the form and repo
 
 Secrets: `ADMIN_TOKEN`, `IP_SALT`, `LINK_SECRET` (uploads), `TURNSTILE_SECRET_KEY`, `WEBHOOK_<NAME>_URL`, `WEBHOOK_SECRET` (JSON webhooks), and your email service's keys.
 
+**Counts:** today's `ok`, `spam` and `autoreply` counts are exact. `invalid`, `rate_limited`, `spam_dropped`, `duplicate` and `file_failed` are **approximate**: each Worker instance holds them in memory and writes them once a minute, so an instance that's shut down loses its last minute. `GET /api/forms` says so too.
+
 ## No cron trigger: how retries and clean-up run
 
 Cloudflare's free plan allows 5 cron triggers per account, and perchlight-guard, perchlight-list and perchlight-updates use 4. So perchlight-forms uses none ([ADR 0001](docs/adr/0001-lazy-housekeeping-no-cron.md)):
 
 - A submission's notifications go out straight after the visitor's reply.
-- Retries and clean-up run **lazily**: after a form post, an admin API call or a request to `GET /tick`, at most once every `HOUSEKEEPING_MINUTES`, with a small bounded amount of work each time (4 notifications, or once an hour the retention clean-up).
+- Retries and clean-up run **lazily**: after a form post, an admin API call or a request to `GET /tick`, at most once every `HOUSEKEEPING_MINUTES`. Within one request's budget, a run starts only if the request has budget left for real work (so a busy post never burns the slot), then: retries R2 deletes that failed; if retention is due (hourly) or part-done, runs its next steps (inbox folder, spam folder, old counters, R2 orphan sweep) as far as the budget allows and saves where it got to, so it continues on the next run and can't be starved; then sends due notifications (up to 4) with what's left. Tested: on a form with 4 channels and 5 files, posts alone (no admin calls, no `/tick`) finish retention and the retries within 3 posts 5 minutes apart.
 - **The trade-off, plainly:** on a quiet site, a failed notification waits for the next request before it's retried, and old submissions wait to be deleted. Nothing is lost (the submission is in D1 from the start), but an alert can be late. **The Perchlight desktop app doesn't wake the Worker**: it reads and writes D1 directly. Its "Try again" and "Back to inbox" take effect at the Worker's next run.
 - **For a quiet site, free:** point an uptime monitor (or your own site's pages) at `https://<your worker>/tick`. It answers 204 and does only the throttled run. Every 5 minutes is 288 requests a day, 0.3% of the free limit, and still no cron trigger.
 
@@ -186,9 +188,9 @@ All under `/api/`, with `Authorization: Bearer <ADMIN_TOKEN>`.
 | `GET /api/submissions?form=&status=&since=&limit=&cursor=` | newest first, up to 200 a page (`status`: new, read, archived, spam or inbox) |
 | `GET /api/submissions/:id` | one, with files and notifications |
 | `PATCH /api/submissions/:id` | `{ "status": "read" \| "new" \| "archived" \| "spam" \| "ok" }`; `ok` (or any inbox status) on a spam one moves it to the inbox and sends the notifications it skipped, once |
-| `DELETE /api/submissions/:id` | with its files and notifications |
-| `DELETE /api/submissions?email=` | every submission from that address, across forms (logs only a count and time) |
-| `GET /api/export?form=&format=csv\|json&status=&since=&email=` | streamed |
+| `DELETE /api/submissions/:id` | with its files and notifications; `filesPending` > 0 means R2 couldn't delete some files yet (they're queued and retried by every housekeeping run) |
+| `DELETE /api/submissions?email=` | every submission from that address, across forms (logs only counts and time); `filesPending` as above. Erasure is finished when `filesPendingDelete` in `GET /api/forms` is 0 |
+| `GET /api/export?form=&format=csv\|json&status=&since=&email=&limit=&cursor=` | streamed, at most 1,000 rows per request; `X-Next-Cursor` (and `Link: rel="next"`) gives the next page. `npm run export -- https://<your worker> "form=contact&format=csv" > contact.csv` (with `ADMIN_TOKEN` set) joins every page. A failure mid-stream aborts the download rather than ending it short |
 | `GET /api/files/:id` · `POST /api/files/:id/link` | download, or a 15-minute signed link |
 | `GET /api/deliveries?status=failed` · `POST /api/deliveries/:id/retry` | failed notifications |
 | `POST /api/test-notify?form=` | a sample through every channel |
@@ -216,7 +218,7 @@ Nothing inside the free plans, measured on the local test run and from the code 
 | Worker requests (free: 100,000/day) | 0 (no cron); 288 if you ping `/tick` every 5 minutes | 1 (+1 preflight for a JSON `fetch` from another site) | about 2,000 (2%) |
 | D1 rows written (free: 100,000/day) | 0; with `/tick`, at most 1 per run when there's no work | about 10 to 15 (submission, notifications and their updates, counters, indexes) | about 15,000 (15%) |
 | D1 rows read (free: 5,000,000/day) | 1 per housekeeping check | about 20 | about 20,000 (0.4%) |
-| Subrequests per request (free: 50) | at most about 20 per housekeeping run | about 6 D1 calls + 1 per file + 1 Turnstile, then about 8 per notification channel (D1 claim, load, finish, the send) | |
+| Subrequests per request (free: 50) | at most about 25 per housekeeping run | about 6 D1 calls + 1 per file + 1 Turnstile, then 3 per notification channel + 2 to load the submission (+3 for an auto-reply) | |
 | R2, if used (free: 10 GB, 1M Class A/month) | 0 | 1 write per file | 20 CVs a day of 1 MB: 0.6 GB a month |
 
 Writes would bind first, at roughly 6,000 submissions a day.
@@ -229,7 +231,7 @@ Writes would bind first, at roughly 6,000 submissions a day.
 
 ## Tested, and not tested
 
-- `npm test`: 110 tests with vitest and the Workers pool (local D1 and R2), against a fake `send_email`, a fake Turnstile, a fake Resend and fake webhooks. They cover:
+- `npm test`: 122 tests with vitest and the Workers pool (local D1 and R2), against a fake `send_email`, a fake Turnstile, a fake Resend and fake webhooks. They cover:
   - plain HTML posts → 303 to the configured or built-in thank-you page; the problem page naming fields, never showing visitor text, linking back only to the form's own site; no `_next` redirect
   - JSON → JSON, CORS only for allowed origins, preflights, 413 / 415 / 422 / 429
   - multipart uploads stored in R2 with their rows; a renamed `.exe`, a wrong extension, SVG and oversize files refused; files never readable without a valid unexpired signed link or the admin token
@@ -238,7 +240,7 @@ Writes would bind first, at roughly 6,000 submissions a day.
   - D1 failing → email fallback → thanks; email failing too → 503 naming `FALLBACK_CONTACT`; R2 files removed when the rows can't be written; spam never emailed in the fallback; the fallback's hourly cap; R2 failing → a 503 that says the file wasn't saved; a constraint error retried rather than treated as an outage
   - the per-request subrequest budget, channel and file caps, duplicate channels refused, attachments in the duplicate hash, in-memory counters and rate blocks, Turnstile action, non-finite numbers, ntfy byte truncation
   - retries on the 1/5/30/120/720-minute schedule, failed after 24 hours, "Try again" sending once, setup errors failed at once, two overlapping runs sending once, stale claims released
-  - lazy housekeeping: the D1 throttle, two runs at once, `/tick`, bounded work per run, retention (inbox, spam, `0` = keep), orphaned R2 files
+  - lazy housekeeping: the D1 throttle, two runs at once, `/tick`, budget-gated slot claims, retention in steps that continue across runs, retries and retention from posts alone on a 4-channel, 5-file form, pending R2 deletes after a failed erasure, paged exports that abort rather than truncate, orphaned R2 files
   - auto-reply: fixed text only, once per address per 24 hours, daily cap, never for spam or unverified Turnstile, unknown not retried, caps released on refusal
   - webhooks (Discord can't ping anyone, JSON signature), email header injection (CRLF, RFC 2047), HTML escaping, CSV formula escaping, export CSV/JSON, delete by email, admin auth
 - **Locally with `wrangler dev`, on 2026-11-10** (free, no account): a real `curl` post with `application/x-www-form-urlencoded` UTF-8 (`Zoë Ångström`) got a 303 to `/thanks/?form=contact`, was stored, and produced a notification email through the local `send_email` binding with a correct RFC 2047 subject and `Reply-To`; a `fetch`-style JSON post got `200 {"ok":true,"id":...}` with `Access-Control-Allow-Origin: https://example.com`; a preflight from another origin got no CORS headers; a missing field landed on the problem page reading "Email is required"; a filled honeypot got the normal thank-you and was stored as spam; the CSV export had its BOM; the API refused a request without the token. (Windows `curl --data-urlencode` with non-UTF-8 console arguments was refused as "encoding", which is the UTF-8 check working.)
