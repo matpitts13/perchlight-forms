@@ -4,7 +4,7 @@
 import { json, fail, readJson, sqlTime, utcDay } from "../lib/http.js";
 import { safeEqual, isId, randomId } from "../lib/crypto.js";
 import { loadSubmission, deliverSubmission, deliver, sendWebhook } from "../lib/deliveries.js";
-import { deleteSubmissions, maybeHousekeep, runHousekeeping, pendingDeleteCount } from "../lib/housekeeping.js";
+import { deleteSubmissions, maybeHousekeep, runHousekeeping, pendingDeleteCount, retentionStatus } from "../lib/housekeeping.js";
 import { spend, COST } from "../lib/budget.js";
 import { signedFileUrl, linkSecretOk } from "../lib/links.js";
 import { getSender, canAutoReply, providerName } from "../lib/senders/index.js";
@@ -53,7 +53,7 @@ export async function handleAdmin(request, app, ctx, path) {
   } else if (m === "GET" && path === "deliveries") res = await listDeliveries(env, q);
   else if (m === "POST" && parts[0] === "deliveries" && parts[2] === "retry" && parts.length === 3) res = await retryDelivery(app, ctx, parts[1]);
   else if (m === "POST" && path === "test-notify") res = await testNotify(app, q);
-  else if (m === "POST" && path === "housekeeping") res = json({ ok: true, ...(await runHousekeeping(app, { force: true })) });
+  else if (m === "POST" && path === "housekeeping") res = json({ ok: true, ...(await runHousekeeping(app, { force: true })), retentionStatus: await retentionStatus(env) });
 
   // Admin calls keep a quiet site's retries and clean-up moving.
   if (path !== "housekeeping") maybeHousekeep(app, ctx);
@@ -94,6 +94,7 @@ async function listForms(app) {
     countsNote:
       "today's ok, spam and autoreply counts are exact; invalid, rate_limited, spam_dropped, duplicate and file_failed are approximate (held in memory and written once a minute per Worker instance, so an evicted instance's last minute can be lost).",
     filesPendingDelete: await pendingDeleteCount(env),
+    retention: await retentionStatus(env),
     housekeeping: { lastRun: state.last_run ?? null, lastRetention: state.last_retention ?? null },
   });
 }

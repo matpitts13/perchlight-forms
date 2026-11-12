@@ -29,6 +29,9 @@ const RETENTION_EVERY_MS = 3600_000;
 const LOCAL_THROTTLE_MS = 15_000;
 const ORPHAN_AGE_MS = 3600_000;
 const IN_CHUNK = 90; // D1 allows 100 bound parameters per statement
+const SWEEP_TRIES = 3; // a sweep page that fails this often in a row is given up and the sweep starts over
+const WAIT_RETRY_MS = 3600_000; // a parked submission is retried at most hourly
+const WAIT_PER_RUN = 2;
 
 let lastLocal = 0;
 /** Tests only: forget this isolate's last check. */
@@ -60,6 +63,7 @@ async function claimSlot(env, key, intervalMs, now) {
 const STEPS = [
   { name: "inbox", cost: COST.retentionFolder, run: (app, now, out) => retentionFolder(app, now, false, out) },
   { name: "spam", cost: COST.retentionFolder, run: (app, now, out) => retentionFolder(app, now, true, out) },
+  { name: "waiting", cost: COST.retentionWaiting, run: (app, now, out) => retentionWaiting(app, now, out) },
   { name: "counters", cost: COST.retentionCounters, run: (app, now) => retentionCounters(app.env, now) },
   { name: "sweep", cost: COST.retentionSweep, run: async (app, now, out) => { if (app.env.FILES) out.orphans = await sweepOrphans(app.env, now); } },
 ];
@@ -86,7 +90,7 @@ export async function runHousekeeping(app, { now = Date.now(), force = false } =
     result.revived = await releaseAndRevive(env, now);
     // One read: retention state, whether R2 deletes are pending, whether any notification is due.
     const { results: stateRows } = await env.DB.prepare(
-      `SELECT key, value FROM state WHERE key IN ('last_retention', 'retention_step')
+      `SELECT key, value FROM state WHERE key IN ('last_retention', 'retention_step', 'retention_errors')
        UNION ALL SELECT 'pending', COUNT(*) FROM (SELECT 1 FROM pending_deletes LIMIT 1)
        UNION ALL SELECT 'due', COUNT(*) FROM (SELECT 1 FROM deliveries WHERE status IN ('pending', 'retry') AND next_attempt_at <= ?1 LIMIT 1)`,
     ).bind(now).all();
@@ -105,7 +109,7 @@ export async function runHousekeeping(app, { now = Date.now(), force = false } =
     const due = force || step > 0 || now - (Number(state.last_retention) || 0) >= RETENTION_EVERY_MS;
     if (due && left(app.budget) - keep >= COST.stateSave + STEPS[step].cost) {
       spend(app.budget, COST.stateSave);
-      const retention = { inbox: 0, spam: 0, orphans: 0, steps: [], failed: [], complete: false };
+      const retention = { inbox: 0, spam: 0, orphans: 0, parked: 0, unparked: 0, steps: [], failed: [], errors: {}, complete: false };
       result.retention = retention;
       try {
         while (step < STEPS.length && left(app.budget) - keep >= STEPS[step].cost) {
@@ -116,25 +120,29 @@ export async function runHousekeeping(app, { now = Date.now(), force = false } =
             await STEPS[step].run(app, now, retention);
             retention.steps.push(STEPS[step].name);
           } catch (err) {
-            console.error(`retention step ${STEPS[step].name}: ${err instanceof Error ? err.message : String(err)}`);
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`retention step ${STEPS[step].name}: ${msg}`);
             retention.failed.push(STEPS[step].name);
-            if (STEPS[step].name === "sweep") {
-              await env.DB.prepare("UPDATE state SET value = '' WHERE key = 'r2_cursor'").run().catch(() => {});
-            }
+            retention.errors[STEPS[step].name] = { error: msg.slice(0, 300), at: new Date(now).toISOString() };
+            if (STEPS[step].name === "sweep") await sweepFailed(env);
           }
           step++;
         }
       } finally {
         retention.complete = step >= STEPS.length;
+        // Problems are kept (per step, newest wins) until that step next succeeds.
+        const errors = { ...parseJson(state.retention_errors), ...retention.errors };
+        for (const name of retention.steps) delete errors[name];
         await guarded("saving retention progress", () =>
-          env.DB.batch(
-            retention.complete
+          env.DB.batch([
+            ...(retention.complete
               ? [
                   env.DB.prepare("UPDATE state SET value = '0' WHERE key = 'retention_step'"),
                   env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'last_retention'").bind(String(now)),
                 ]
-              : [env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'retention_step'").bind(String(step))],
-          ),
+              : [env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'retention_step'").bind(String(step))]),
+            env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'retention_errors'").bind(JSON.stringify(errors)),
+          ]),
         );
       }
     }
@@ -143,6 +151,28 @@ export async function runHousekeeping(app, { now = Date.now(), force = false } =
     result.deliveries = await guarded("deliveries", () => deliverDue(app, DELIVERIES_PER_RUN, now), { tried: 0, sent: 0 });
   }
   return result;
+}
+
+function parseJson(s) {
+  try {
+    const v = JSON.parse(s ?? "{}");
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+/** A sweep page failed: keep the place for two more tries, then start over. */
+async function sweepFailed(env) {
+  await guarded("sweep failure count", () =>
+    env.DB.batch([
+      env.DB.prepare("UPDATE state SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'r2_failures'"),
+      env.DB.prepare(
+        "UPDATE state SET value = '' WHERE key = 'r2_cursor' AND (SELECT CAST(value AS INTEGER) FROM state WHERE key = 'r2_failures') >= ?1",
+      ).bind(SWEEP_TRIES),
+      env.DB.prepare("UPDATE state SET value = '0' WHERE key = 'r2_failures' AND CAST(value AS INTEGER) >= ?1").bind(SWEEP_TRIES),
+    ]),
+  );
 }
 
 async function guarded(what, fn, fallback = null) {
@@ -224,18 +254,81 @@ export async function pendingDeleteCount(env) {
   return row?.n ?? 0;
 }
 
-async function retentionFolder(app, now, spam, out) {
-  const { env } = app;
+/** The cut-off for each folder, or null for "keep forever". */
+export function retentionCutoffs(env, now = Date.now()) {
   const s = settings(env);
   const DAY = 86400_000;
-  const days = spam ? s.spamRetentionDays : s.retentionDays;
-  if (!spam && days === 0) return; // RETENTION_DAYS=0: keep the inbox until deleted
+  return { inbox: s.retentionDays > 0 ? now - s.retentionDays * DAY : null, spam: now - s.spamRetentionDays * DAY };
+}
+
+/**
+ * Deletes up to RETENTION_BATCH expired submissions of one folder, oldest
+ * first, skipping ones parked in retention_waiting. If R2 can't delete their
+ * files, the whole batch is parked (kept, with its files) and the next run
+ * moves on to newer expired submissions; the "waiting" step then retries the
+ * parked ones one by one, so only a submission whose files really can't be
+ * deleted keeps waiting.
+ */
+async function retentionFolder(app, now, spam, out) {
+  const { env } = app;
+  const cut = retentionCutoffs(env, now)[spam ? "spam" : "inbox"];
+  if (cut === null) return; // RETENTION_DAYS=0: keep the inbox until deleted
   const { results } = await env.DB.prepare(
-    `SELECT id FROM submissions WHERE status ${spam ? "=" : "!="} 'spam' AND created_ms < ?1 ORDER BY created_ms LIMIT ?2`,
-  ).bind(now - days * DAY, RETENTION_BATCH).all();
+    `SELECT id FROM submissions WHERE status ${spam ? "=" : "!="} 'spam' AND created_ms < ?1
+       AND id NOT IN (SELECT submission_id FROM retention_waiting)
+     ORDER BY created_ms LIMIT ?2`,
+  ).bind(cut, RETENTION_BATCH).all();
   if (!results.length) return;
-  const r = await deleteSubmissions(env, results.map((x) => x.id), { keepRowsOnR2Failure: true });
+  const ids = results.map((x) => x.id);
+  const r = await deleteSubmissions(env, ids, { keepRowsOnR2Failure: true });
   out[spam ? "spam" : "inbox"] += r.deleted;
+  if (r.deleted < ids.length) {
+    // Parked: retried one by one by the "waiting" step, starting now.
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO retention_waiting (submission_id, since_ms, retry_after, last_error)
+       SELECT id, ?1, ?1, 'R2 could not delete its files' FROM submissions WHERE id IN (${ids.map((_, i) => `?${i + 2}`).join(", ")})`,
+    ).bind(now, ...ids).run();
+    out.parked += ids.length - r.deleted;
+  }
+}
+
+/** Retries parked submissions one at a time; a failure waits another hour. */
+async function retentionWaiting(app, now, out) {
+  const { env } = app;
+  const { results } = await env.DB.prepare(
+    "SELECT submission_id FROM retention_waiting WHERE retry_after <= ?1 ORDER BY retry_after LIMIT ?2",
+  ).bind(now, WAIT_PER_RUN).all();
+  for (const { submission_id: id } of results) {
+    const r = await deleteSubmissions(env, [id], { keepRowsOnR2Failure: true });
+    if (r.deleted) out.unparked++; // its retention_waiting row goes with it (cascade)
+    else {
+      await env.DB.prepare(
+        "UPDATE retention_waiting SET retry_after = ?2, attempts = attempts + 1, last_error = 'R2 could not delete its files' WHERE submission_id = ?1",
+      ).bind(id, now + WAIT_RETRY_MS).run();
+    }
+  }
+}
+
+/** What GET /api/forms and POST /api/housekeeping show about retention. */
+export async function retentionStatus(env, now = Date.now()) {
+  const cut = retentionCutoffs(env, now);
+  const [oldest, waiting, errors] = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT MIN(created_ms) AS ms, COUNT(*) AS n FROM submissions
+       WHERE (status = 'spam' AND created_ms < ?1) OR (?2 IS NOT NULL AND status != 'spam' AND created_ms < ?2)`,
+    ).bind(cut.spam, cut.inbox),
+    env.DB.prepare("SELECT COUNT(*) AS n, MIN(since_ms) AS since FROM retention_waiting"),
+    env.DB.prepare("SELECT value FROM state WHERE key = 'retention_errors'"),
+  ]);
+  const o = oldest.results[0];
+  const w = waiting.results[0];
+  return {
+    expiredNotYetDeleted: o.n,
+    oldestExpired: o.ms ? new Date(o.ms).toISOString() : null,
+    retentionSkipped: w.n,
+    skippedSince: w.since ? new Date(w.since).toISOString() : null,
+    problems: parseJson(errors.results[0]?.value),
+  };
 }
 
 async function retentionCounters(env, now) {
@@ -272,6 +365,9 @@ async function sweepOrphans(env, now) {
   }
   // Orphans R2 refuses to delete now are simply found again on a later sweep.
   if (orphans.length) await deleteObjects(env, orphans);
-  await env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'r2_cursor'").bind(listed.truncated ? listed.cursor : "").run();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'r2_cursor'").bind(listed.truncated ? listed.cursor : ""),
+    env.DB.prepare("UPDATE state SET value = '0' WHERE key = 'r2_failures'"),
+  ]);
   return orphans.length;
 }

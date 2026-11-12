@@ -27,17 +27,20 @@ export const COST = {
   // pending R2 deletes: select, R2 delete, delete rows
   pending: 3,
   // one retention folder (inbox or spam): select ids, select file keys, R2
-  // delete, delete rows. If R2 fails, those rows are left for a later run
-  // (no pending-delete inserts on this path), so 4 is the worst case.
-  retentionFolder: 4,
+  // delete, delete rows; if the R2 delete fails, one insert that parks the
+  // batch in retention_waiting instead of the delete (no pending-delete writes)
+  retentionFolder: 5,
+  // submissions waiting after an R2 failure: a select, then for each of up
+  // to 2: select keys, R2 delete, delete the row or reschedule it
+  retentionWaiting: 7,
   // old counters, hashes and delivery rows: one batch
   retentionCounters: 1,
   // R2 orphan sweep: state read, list, two IN (...) selects for 100 keys, R2 delete, cursor update
   retentionSweep: 6,
   // saving retention progress
   stateSave: 1,
-  // admin API: the largest read-only handler (GET /api/forms: 5 queries)
-  admin: 5,
+  // admin API: the largest read-only handler (GET /api/forms: 6 calls)
+  admin: 6,
   // DELETE ...?email= (40 submissions a call, up to 5 files each): select ids,
   // select keys, R2 delete, up to 5 pending-delete inserts, delete rows
   adminDeleteByEmail: 9,

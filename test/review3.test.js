@@ -25,7 +25,7 @@ async function insertOldWithFile(id) {
 }
 
 describe("1. a failing retention step never blocks retries", () => {
-  it("a sweep that always throws: retention still completes, the cursor is cleared, retries go out, and the next run is fine", async () => {
+  it("a sweep that always throws: retention still completes, retries go out, and the next run is fine (the cursor is kept for 3 tries, see review4)", async () => {
     await failedDelivery();
     await env.DB.prepare("UPDATE state SET value = 'poisoned-cursor' WHERE key = 'r2_cursor'").run();
     const files = { list: async () => { throw new Error("bad cursor"); }, delete: async () => {}, put: async () => {}, get: async () => null };
@@ -34,7 +34,7 @@ describe("1. a failing retention step never blocks retries", () => {
     expect(r.retention.failed).toEqual(["sweep"]);
     expect(r.retention.complete).toBe(true);
     expect((await rows("SELECT value FROM state WHERE key = 'retention_step'"))[0].value).toBe("0");
-    expect((await rows("SELECT value FROM state WHERE key = 'r2_cursor'"))[0].value).toBe("");
+    expect((await rows("SELECT value FROM state WHERE key = 'r2_failures'"))[0].value).toBe("1");
     expect(r.deliveries.tried).toBeGreaterThan(0);
     expect(email.sent).toHaveLength(1);
     await expect(runHousekeeping(makeApp({ FILES: files, EMAIL: email.binding }), { force: true })).resolves.toMatchObject({ ran: true });
@@ -77,7 +77,7 @@ describe("3. retention never needs pending-delete writes", () => {
     expect(r.retention.inbox).toBe(0);
     expect(await rows("SELECT id FROM submissions")).toHaveLength(1);
     expect(await rows("SELECT * FROM pending_deletes")).toHaveLength(0);
-    expect(COST.retentionFolder).toBe(4);
+    expect(COST.retentionFolder).toBe(5); // 4 + the insert that parks a batch (review4)
   });
 });
 

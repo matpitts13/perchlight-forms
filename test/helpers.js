@@ -188,9 +188,9 @@ export async function resetAll() {
   resetBlocked();
   resetFallbackCap();
   await env.DB.batch(
-    ["files", "deliveries", "submissions", "rate_counters", "daily_counts", "autoreply_sent", "pending_deletes"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)),
+    ["files", "deliveries", "submissions", "rate_counters", "daily_counts", "autoreply_sent", "pending_deletes", "retention_waiting"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)),
   );
-  await env.DB.prepare("UPDATE state SET value = CASE key WHEN 'r2_cursor' THEN '' ELSE '0' END").run();
+  await env.DB.prepare("UPDATE state SET value = CASE key WHEN 'r2_cursor' THEN '' WHEN 'retention_errors' THEN '{}' ELSE '0' END").run();
   let cursor;
   do {
     const listed = await env.FILES.list({ cursor, limit: 1000 });
