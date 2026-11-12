@@ -10,6 +10,7 @@ import { signedFileUrl, linkSecretOk } from "./links.js";
 import { settings } from "./settings.js";
 import { hmacHex } from "./crypto.js";
 import { sqlTime, utcDay } from "./http.js";
+import { spend, COST } from "./budget.js";
 
 export const BACKOFF_MINUTES = [1, 5, 30, 120, 720];
 export const WINDOW_MS = 24 * 3600_000;
@@ -176,15 +177,21 @@ async function attempt(app, delivery, sub, now) {
 /** Claims, sends and records one delivery row. Returns its new status, or null if someone else had it. */
 export async function deliver(app, delivery, now = Date.now(), subCache = new Map()) {
   const { env } = app;
-  if (!(await claim(env, delivery.id, now))) return null;
-  let sub = subCache.get(delivery.submission_id);
-  if (sub === undefined) {
-    sub = await loadSubmission(env, delivery.submission_id);
-    subCache.set(delivery.submission_id, sub);
+  // A D1 error while claiming means nobody holds the row: just leave it for later.
+  try {
+    if (!(await claim(env, delivery.id, now))) return null;
+  } catch (err) {
+    console.error(`claim ${delivery.id}: ${errText(err)}`);
+    return null;
   }
-  if (!sub) return null; // deleted meanwhile; its deliveries went with it
   let r;
   try {
+    let sub = subCache.get(delivery.submission_id);
+    if (sub === undefined) {
+      sub = await loadSubmission(env, delivery.submission_id);
+      subCache.set(delivery.submission_id, sub);
+    }
+    if (!sub) return null; // deleted meanwhile; its deliveries went with it
     r = await attempt(app, delivery, sub, now);
   } catch (err) {
     r = { status: "retry", error: errText(err) };
@@ -214,18 +221,28 @@ export async function deliver(app, delivery, now = Date.now(), subCache = new Ma
     default: // config, rejected: a setup problem; not retried every few minutes
       outcome = { status: "failed", error: r.error };
   }
-  await finish(env, delivery.id, now, outcome);
+  try {
+    await finish(env, delivery.id, now, outcome);
+  } catch (err) {
+    // The claim stays; it's released as stale after 2 minutes (auto-replies become "unknown").
+    console.error(`finish ${delivery.id}: ${errText(err)}`);
+  }
   return outcome.status;
 }
 
 /** Sends one submission's due deliveries (right after the reply). */
 export async function deliverSubmission(app, submissionId, now = Date.now()) {
+  if (!spend(app.budget, COST.deliverySelect)) return [];
   const { results } = await app.env.DB.prepare(
     "SELECT * FROM deliveries WHERE submission_id = ?1 AND status IN ('pending', 'retry') AND next_attempt_at <= ?2",
   ).bind(submissionId, now).all();
   const cache = new Map();
   const out = [];
-  for (const d of results) out.push(await deliver(app, d, now, cache));
+  for (const d of results) {
+    // Out of budget: the rest are sent by the next housekeeping run.
+    if (!spend(app.budget, COST.delivery)) break;
+    out.push(await deliver(app, d, now, cache));
+  }
   return out;
 }
 
@@ -236,8 +253,13 @@ export async function deliverDue(app, limit, now = Date.now()) {
   ).bind(now, limit).all();
   const cache = new Map();
   let sent = 0;
-  for (const d of results) if ((await deliver(app, d, now, cache)) === "sent") sent++;
-  return { tried: results.length, sent };
+  let tried = 0;
+  for (const d of results) {
+    if (!spend(app.budget, COST.delivery)) break;
+    tried++;
+    if ((await deliver(app, d, now, cache)) === "sent") sent++;
+  }
+  return { tried, sent };
 }
 
 /** Claims older than 2 minutes belong to a run that died. Auto-replies

@@ -273,8 +273,9 @@ Everything under `/api/`, with `Authorization: Bearer <ADMIN_TOKEN>` (constant-t
 - `files`: `id`, `submission_id`, `field`, `name`, `content_type`, `size`, `sha256`, `r2_key`, `created_at`.
 - `deliveries`: `id`, `submission_id`, `channel`, `status` (`pending` | `sending` | `retry` | `sent` | `failed` | `unknown` | `skipped`), `attempts`, `next_attempt_at`, `claimed_at`, `sent_at`, `last_error`. Unique on `(submission_id, channel)`; index `(status, next_attempt_at)`.
 - `rate_counters`: `key`, `hour`, `count`. Primary key `(key, hour)`.
-- `daily_counts`: `day`, `form_id`, `kind` (`ok` | `spam` | `spam_dropped` | `rate_limited` | `invalid`), `count`.
-- `autoreply_sent`: `email_hash`, `day`. Deleted after 2 days.
+- `daily_counts`: `day`, `form_id`, `kind` (`ok` | `spam` | `spam_dropped` | `rate_limited` | `invalid` | `duplicate` | `autoreply`), `count`. The row `form_id = '*'`, `kind = 'spam_cap'` is the deployment-wide count of stored spam for `SPAM_DAILY_CAP`. `invalid`, `rate_limited`, `spam_dropped` and `duplicate` are buffered in memory and written once a minute per isolate.
+- `autoreply_sent`: `email_hash` (HMAC of the address with `IP_SALT`, primary key), `sent_ms`. Deleted after 2 days.
+- `state`: `key`, `value`: the housekeeping timestamps (`last_run`, `last_retention`) and the R2 sweep's `r2_cursor`.
 
 Foreign keys cascade from `submissions` to `files` and `deliveries`; R2 objects are deleted by the Worker before the row.
 
@@ -311,7 +312,7 @@ Measured during the build; first estimates:
 | Worker requests (limit 100,000/day) | 0 (288 if you ping `/tick` every 5 minutes) | 1 (+1 preflight for JSON `fetch`; the thank-you page is your own site or a static asset) | about 2,300 (2.3%) |
 | D1 rows written (limit 100,000/day) | 0 without traffic; at most 1 per housekeeping run with no work | about 15 (submission, deliveries and their updates, counters, indexes) | about 15,000 (15%) |
 | D1 rows read (limit 5,000,000/day) | about 1,000 | about 20 | about 21,000 (0.4%) |
-| Subrequests (limit 50/request) | — | 1 Turnstile + 1 per channel | — |
+| Subrequests (limit 50/request) | about 20 per housekeeping run | about 6 D1 calls + 1 per file + 1 Turnstile, then about 8 per channel (unverified whether binding calls count; assumed yes, budget 45) | — |
 | R2 (if used; 10 GB, 1M Class A/month) | 0 | 1 write per file | e.g. 20 CVs a day of 1 MB: 0.6 GB/month, about 0.1% of Class A |
 
 So on Free, writes are the limit that would bind first, at roughly 6,000 submissions a day. Spam is capped (`SPAM_DAILY_CAP`) so a bot flood can't use the writes up.
@@ -351,6 +352,12 @@ The owner approved the design with these answers:
 - When `MAIL_PROVIDER` is an email service, all notifications go through it (not only auto-replies).
 - A spam submission that arrives while D1 is down is emailed to you marked as possible spam (honeypot hits get the normal answer and nothing else).
 - `GET /tick` and `POST /api/housekeeping` were added for the lazy housekeeping.
+- **Subrequest budget (after review):** each request has a budget of 45 calls (assuming D1, R2 and `send_email` count toward the 50, which isn't confirmed). A post reserves its own notifications first; housekeeping gets the rest and defers what doesn't fit. Forms are limited to 4 notification channels and 5 files, and a repeated address or webhook name is a config error (it would break the deliveries UNIQUE key).
+- **Fallback limits (after review):** spam-flagged posts are never emailed while D1 is down, and each isolate sends at most 20 fallback emails an hour.
+- **R2 failure (after review):** the visitor gets a 503 saying the attachment wasn't saved; nothing is stored. A D1 constraint error is retried once with fresh ids instead of being treated as an outage.
+- **Flood writes (after review):** refused-post counters are buffered per isolate (one batch a minute), and a network over its hourly limit is refused from memory. Each post from a new network still writes its rate counter.
+- **Also added after review:** the duplicate hash includes attachments (field, size, SHA-256); optional `spam.turnstileAction`; numbers that don't fit a double are refused; `WEBHOOK_SECRET` needs 16+ characters; a switched-off form still sends CORS headers to its origins; the config is checked once per isolate.
+- `daily_counts` gained the kinds `duplicate`, `autoreply` and the `'*'`/`spam_cap` row; `autoreply_sent` is `(email_hash, sent_ms)`.
 
 ## Couldn't confirm (2026-11-10)
 

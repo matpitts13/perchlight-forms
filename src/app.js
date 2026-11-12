@@ -9,6 +9,19 @@ import { problemPage } from "./routes/pages.js";
 import { fileDownload } from "./routes/files.js";
 import { handleAdmin } from "./routes/admin.js";
 import { maybeHousekeep } from "./lib/housekeeping.js";
+import { newBudget } from "./lib/budget.js";
+
+// The checked config depends only on forms.json and the env's bindings and
+// secrets, which are fixed for an isolate: check once per env object.
+const checked = new WeakMap();
+export function formsFor(rawForms, env) {
+  let forms = checked.get(env);
+  if (!forms) {
+    forms = checkForms(rawForms, envInfo(env, canAutoReply(env)));
+    checked.set(env, forms);
+  }
+  return forms;
+}
 
 export function makeWorker(rawForms) {
   return {
@@ -17,8 +30,9 @@ export function makeWorker(rawForms) {
       const path = url.pathname;
       const app = {
         env,
-        forms: checkForms(rawForms, envInfo(env, canAutoReply(env))),
+        forms: formsFor(rawForms, env),
         base: settings(env).publicUrl || url.origin,
+        budget: newBudget(),
       };
       try {
         if (path === "/api" || path.startsWith("/api/")) return await handleAdmin(request, app, ctx, path.slice(5));

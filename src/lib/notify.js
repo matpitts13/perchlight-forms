@@ -145,14 +145,14 @@ export async function webhookRequest(env, format, form, sub, files, now = Date.n
       let body = summary ? sub.created_at : chatLines(form, sub, (s) => s).join("\n");
       if (fileNote) body += `\n${fileNote}`;
       // ntfy turns bodies over 4,096 bytes into attachments; headers must be Latin-1.
-      if (new TextEncoder().encode(body).length > 4000) body = `${body.slice(0, 3900)}\n...`;
+      if (new TextEncoder().encode(body).length > 4000) body = `${truncateBytes(body, 3900)}\n...`;
       return {
         body,
         headers: { "Content-Type": "text/plain; charset=utf-8", Title: title.replace(/[^\x20-\x7e]/g, "?").slice(0, 120), Tags: "envelope" },
       };
     }
     default: {
-      if (!env.WEBHOOK_SECRET) return { error: "Set the WEBHOOK_SECRET secret: JSON webhooks are signed with it." };
+      if (String(env.WEBHOOK_SECRET ?? "").length < 16) return { error: "Set the WEBHOOK_SECRET secret (16+ characters): JSON webhooks are signed with it." };
       const payload = {
         form: form.id,
         formName: form.name,
@@ -178,6 +178,20 @@ export async function webhookRequest(env, format, form, sub, files, now = Date.n
       };
     }
   }
+}
+
+/** Cuts text to at most maxBytes of UTF-8, never inside a character. */
+export function truncateBytes(text, maxBytes) {
+  const enc = new TextEncoder();
+  let out = "";
+  let used = 0;
+  for (const ch of text) {
+    const n = enc.encode(ch).length;
+    if (used + n > maxBytes) break;
+    out += ch;
+    used += n;
+  }
+  return out;
 }
 
 /** The fixed auto-reply. Nothing the visitor typed goes in it. */

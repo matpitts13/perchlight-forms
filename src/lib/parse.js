@@ -253,7 +253,8 @@ export async function checkSubmission(form, entries, isJson) {
     }
     if (field.type === "email" && !isEmail(v)) errors[field.name] = "email";
     else if (field.type === "url" && !isWebUrl(v)) errors[field.name] = "url";
-    else if (field.type === "number" && !/^-?\d+(\.\d+)?$/.test(v)) errors[field.name] = "number";
+    // Long digit strings parse to Infinity, which JSON stores as null: refuse them.
+    else if (field.type === "number" && (!/^-?\d+(\.\d+)?$/.test(v) || !Number.isFinite(Number(v)))) errors[field.name] = "number";
     else if (field.type === "tel" && !/^[0-9+()\-.\s]{3,40}$/.test(v)) errors[field.name] = "tel";
     else if (field.type === "select" && !field.options.includes(v)) errors[field.name] = "option";
     else data[field.name] = field.type === "number" ? Number(v) : v;

@@ -14,6 +14,7 @@
 import { deliverDue, releaseStale, reviveSkipped } from "./deliveries.js";
 import { settings } from "./settings.js";
 import { utcDay } from "./http.js";
+import { spend, COST } from "./budget.js";
 
 export const DELIVERIES_PER_RUN = 4;
 export const RETENTION_BATCH = 40;
@@ -53,6 +54,9 @@ async function claimSlot(env, key, intervalMs, now) {
 export async function runHousekeeping(app, { now = Date.now(), force = false } = {}) {
   const { env } = app;
   const s = settings(env);
+  // Not enough left of this request's budget (a post's own notifications
+  // came first): the next request runs it.
+  if (!spend(app.budget, COST.housekeepingBase)) return { ran: false, budget: true };
   if (force) {
     await env.DB.prepare("UPDATE state SET value = CAST(?1 AS TEXT) WHERE key = 'last_run'").bind(now).run();
   } else if (!(await claimSlot(env, "last_run", s.housekeepingMinutes * 60_000, now))) {
@@ -64,9 +68,22 @@ export async function runHousekeeping(app, { now = Date.now(), force = false } =
   // 25 D1 queries or fewer, even on top of a form post's own work.
   let retention = null;
   let deliveries = null;
-  if (force || (await claimSlot(env, "last_retention", RETENTION_EVERY_MS, now))) retention = await runRetention(app, now);
+  if ((app.budget?.left ?? Infinity) >= COST.retention && (force || (await claimSlot(env, "last_retention", RETENTION_EVERY_MS, now)))) {
+    spend(app.budget, COST.retention);
+    retention = await runRetention(app, now);
+  }
   if (force || !retention) deliveries = await deliverDue(app, DELIVERIES_PER_RUN, now);
   return { ran: true, deliveries, revived, retention };
+}
+
+/** Deletes R2 objects; a failure is logged, not thrown, so the rest of the
+ *  clean-up goes on. Anything left is found again by the orphan sweep. */
+async function deleteObjects(env, keys) {
+  try {
+    await env.FILES.delete(keys);
+  } catch (err) {
+    console.error(`R2 delete of ${keys.length} object(s): ${err instanceof Error ? err.message : String(err)}; the orphan sweep will retry`);
+  }
 }
 
 /** Deletes submissions (R2 files first, then rows; files and deliveries cascade). */
@@ -76,7 +93,7 @@ export async function deleteSubmissions(env, ids) {
     const chunk = ids.slice(i, i + IN_CHUNK);
     const marks = chunk.map((_, j) => `?${j + 1}`).join(", ");
     const { results } = await env.DB.prepare(`SELECT r2_key FROM files WHERE submission_id IN (${marks})`).bind(...chunk).all();
-    if (results.length && env.FILES) await env.FILES.delete(results.map((r) => r.r2_key));
+    if (results.length && env.FILES) await deleteObjects(env, results.map((r) => r.r2_key));
     // RETURNING, not meta.changes: changes also counts the cascaded file and delivery rows.
     const r = await env.DB.prepare(`DELETE FROM submissions WHERE id IN (${marks}) RETURNING id`).bind(...chunk).all();
     deleted += r.results.length;
@@ -134,7 +151,7 @@ async function sweepOrphans(env, now) {
     const known = new Set(results.map((r) => r.r2_key));
     orphans.push(...chunk.filter((k) => !known.has(k)));
   }
-  if (orphans.length) await env.FILES.delete(orphans);
+  if (orphans.length) await deleteObjects(env, orphans);
   await env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'r2_cursor'").bind(listed.truncated ? listed.cursor : "").run();
   return orphans.length;
 }

@@ -24,6 +24,7 @@ Option 3.
 - **Throttle:** one conditional `UPDATE state SET value = now WHERE key = 'last_run' AND value <= now - interval`. Only the request whose update changed the row runs, so two requests at once can't both run it. Before that, each isolate skips the D1 check if it looked in the last 15 seconds, so a busy site doesn't pay a D1 query per request.
 - **Bounded work:** a run releases stale claims, sends notifications whose submission left the spam folder, and then either sends up to 4 due notifications or, once an hour instead, does retention (up to 40 expired submissions per folder with their R2 files, old counters, and a 100-object sweep of R2 for orphaned files). That is at most about 25 D1 queries and 4 outbound requests, so even on top of a form post's own work (about 17 queries) one request stays under 50. CPU is spent on JSON and HMAC for a handful of rows; the waiting is I/O, which doesn't count toward the 10 ms.
 - **The form post's own notifications** go out straight after its reply, not through the throttle, so the first attempt is never delayed.
+- **One budget per request** (`src/lib/budget.js`, 45 calls): Cloudflare doesn't confirm whether D1, R2 and `send_email` binding calls count toward the 50 subrequests, so all are assumed to. A post reserves its own notifications first; a housekeeping run starts only if 5 calls are left, does retention only if 14 more are, and sends due notifications while 8 each remain.
 - **`POST /api/housekeeping`** runs it now, ignoring the throttle.
 
 ## Consequences

@@ -5,7 +5,7 @@
 const VERIFY = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
 /**
- * @returns {Promise<{ result: "passed", hostname: string | null }
+ * @returns {Promise<{ result: "passed", hostname: string | null, action: string | null }
  *   | { result: "failed", codes: string[] } | { result: "unverified", error: string }>}
  */
 export async function verifyTurnstile(env, token, ip) {
@@ -19,7 +19,13 @@ export async function verifyTurnstile(env, token, ip) {
     const res = await fetch(VERIFY, { method: "POST", body, signal: AbortSignal.timeout(5000) });
     if (!res.ok) return { result: "unverified", error: `siteverify answered HTTP ${res.status}` };
     const data = await res.json();
-    if (data.success === true) return { result: "passed", hostname: typeof data.hostname === "string" ? data.hostname : null };
+    if (data.success === true) {
+      return {
+        result: "passed",
+        hostname: typeof data.hostname === "string" ? data.hostname : null,
+        action: typeof data.action === "string" ? data.action : null,
+      };
+    }
     const codes = Array.isArray(data["error-codes"]) ? data["error-codes"].map(String) : [];
     // A bad secret is our setup problem, not the visitor's: let it through as unverified.
     if (codes.some((c) => c === "invalid-input-secret" || c === "missing-input-secret")) {

@@ -24,6 +24,10 @@ export function scoreSpam(form, sub, { origin, turnstile }) {
     const hosts = form.origins.map((o) => new URL(o).hostname);
     if (!hosts.includes(turnstile.hostname)) hard.push(`turnstile token from ${turnstile.hostname.slice(0, 100)}`);
   }
+  // The widget's data-action, if the form names one: a token minted for another form or page.
+  if (turnstile?.result === "passed" && form.spam.turnstileAction && turnstile.action !== form.spam.turnstileAction) {
+    hard.push(`turnstile action ${String(turnstile.action ?? "none").slice(0, 40)}`);
+  }
   if (turnstile?.result === "unverified") soft.push("turnstile unverified");
 
   if (sub.elapsedMs !== null && form.spam.minSeconds > 0 && sub.elapsedMs < form.spam.minSeconds * 1000) {
@@ -66,7 +70,9 @@ export async function rateKey(salt, day, formId, ip) {
 }
 
 /** Same content sent to the same form: a double click or a refresh. */
-export async function contentHash(formId, data, extra) {
+/** Attachments count too (field, size and SHA-256), so a resent corrected file isn't collapsed. */
+export async function contentHash(formId, data, extra, files = []) {
   const sorted = (o) => Object.fromEntries(Object.entries(o ?? {}).sort(([a], [b]) => (a < b ? -1 : 1)));
-  return sha256Hex(`${formId}\n${JSON.stringify(sorted(data))}\n${JSON.stringify(sorted(extra))}`);
+  const fileKey = files.map((f) => `${f.field}:${f.bytes?.byteLength ?? f.size}:${f.sha256}`).join(",");
+  return sha256Hex(`${formId}\n${JSON.stringify(sorted(data))}\n${JSON.stringify(sorted(extra))}\n${fileKey}`);
 }

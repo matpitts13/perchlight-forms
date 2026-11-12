@@ -380,7 +380,7 @@ describe("when D1 can't be written", () => {
     const res = await postForm("contact", good, { env: { DB: brokenDb(), EMAIL: email.binding } });
     expect(res.status).toBe(503);
     const html = await res.text();
-    expect(html).toContain("We couldn't save your message");
+    expect(html).toContain("save your message");
     expect(html).toContain("help@example.com");
     const j = await postJson("contact", good, { env: { DB: brokenDb(), EMAIL: email.binding } });
     expect(j.status).toBe(503);

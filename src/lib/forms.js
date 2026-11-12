@@ -14,6 +14,8 @@ const FIELD_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const WEBHOOK_NAME = /^[A-Za-z0-9_]{1,40}$/;
 const EMAIL = /^[^\s@<>()"',;:\\]+@[^\s@<>()"',;:\\]+\.[^\s@<>()"',;:\\]+$/;
 const MAX_FIELDS = 50;
+export const MAX_CHANNELS = 4;
+export const MAX_FILES = 5;
 const HARD_MAX_MB = 95;
 
 export const isEmail = (s) => typeof s === "string" && s.length <= 254 && EMAIL.test(s);
@@ -49,9 +51,13 @@ export function checkForms(raw, info) {
   for (const [id, def] of Object.entries(raw)) {
     if (id.startsWith("$")) continue; // "$comment", "$schema"
     try {
-      out.set(id, { id, ok: true, error: null, form: checkForm(id, def, info) });
+      const form = checkForm(id, def, info);
+      out.set(id, { id, ok: true, error: null, form, origins: form.origins });
     } catch (err) {
-      out.set(id, { id, ok: false, error: err instanceof Error ? err.message : String(err), form: null });
+      // A switched-off form keeps its valid origins, so a browser on those
+      // sites can read its 503 (CORS) instead of a bare network error.
+      const origins = Array.isArray(def?.origins) ? def.origins.filter((o) => typeof o === "string" && origin(o)) : [];
+      out.set(id, { id, ok: false, error: err instanceof Error ? err.message : String(err), form: null, origins });
     }
   }
   return out;
@@ -157,7 +163,13 @@ function checkForm(id, def, info) {
   if (typeof notifyIn !== "object" || Array.isArray(notifyIn)) bad('"notify" must be an object');
   const emails = strList(notifyIn.email, '"notify.email"', 254);
   for (const e of emails) if (!isEmail(e)) bad(`"notify.email": "${e}" isn't an email address`);
-  if (emails.length > 10) bad('"notify.email": at most 10 addresses');
+  // Each address is its own delivery row, unique per submission: a repeat
+  // (in any letter case) would make every submission's write fail.
+  const seenEmails = new Set();
+  for (const e of emails) {
+    if (seenEmails.has(e.toLowerCase())) bad(`"notify.email": "${e}" is listed twice`);
+    seenEmails.add(e.toLowerCase());
+  }
   const webhooks = [];
   for (const w of Array.isArray(notifyIn.webhooks) ? notifyIn.webhooks : notifyIn.webhooks ? bad('"notify.webhooks" must be a list') : []) {
     const wname = typeof w === "string" ? w : w?.name;
@@ -165,6 +177,7 @@ function checkForm(id, def, info) {
     if (typeof wname !== "string" || !WEBHOOK_NAME.test(wname)) bad('"notify.webhooks": names are letters, digits and _');
     if (format !== undefined && !["discord", "slack", "ntfy", "json"].includes(format)) bad(`webhook "${wname}": format must be discord, slack, ntfy or json`);
     if (info && !info.webhook(wname)) bad(`webhook "${wname}": set the secret WEBHOOK_${wname.toUpperCase()}_URL (an https URL)`);
+    if (webhooks.some((x) => x.name === wname.toLowerCase())) bad(`webhook "${wname}" is listed twice`);
     webhooks.push({ name: wname.toLowerCase(), format: format ?? null });
   }
   const content = notifyIn.content ?? "full";
@@ -174,8 +187,14 @@ function checkForm(id, def, info) {
   const turnstile = spamIn.turnstile === true;
   if (spamIn.turnstile !== undefined && typeof spamIn.turnstile !== "boolean") bad('"spam.turnstile" must be true or false');
   if (turnstile && info && !info.turnstile) bad('"spam.turnstile" is on but the TURNSTILE_SECRET_KEY secret isn\'t set');
+  const turnstileAction = spamIn.turnstileAction ?? null;
+  if (turnstileAction !== null && (typeof turnstileAction !== "string" || !/^[A-Za-z0-9_-]{1,32}$/.test(turnstileAction))) {
+    bad('"spam.turnstileAction" must be up to 32 letters, digits, _ or - (the widget\'s data-action)');
+  }
+  if (turnstileAction && !turnstile) bad('"spam.turnstileAction" needs "spam.turnstile" on');
   const spam = {
     turnstile,
+    turnstileAction,
     honeypot,
     minSeconds: num(spamIn.minSeconds, '"spam.minSeconds"', { min: 0, max: 3600, fallback: 3 }),
     maxLinks: num(spamIn.maxLinks, '"spam.maxLinks"', { min: 0, max: 1000, fallback: 2 }),
@@ -206,6 +225,13 @@ function checkForm(id, def, info) {
     if (info && !info.autoReply) bad('"autoReply" needs MAIL_PROVIDER set to an email service (resend, ses, mailgun, postmark or cloudflare); send_email only reaches your own verified addresses');
     autoReply = { subject: a.subject, text: a.text, dailyCap: num(a.dailyCap, '"autoReply.dailyCap"', { min: 1, max: 10000, fallback: 50 }) };
   }
+
+  // One request (a post and its notifications) must fit the per-request
+  // subrequest budget; see SUBREQUEST_BUDGET in src/lib/budget.js.
+  const channels = emails.length + webhooks.length + (autoReply ? 1 : 0);
+  if (channels > MAX_CHANNELS) bad(`at most ${MAX_CHANNELS} notification channels per form (email addresses + webhooks + auto-reply); this has ${channels}`);
+  const totalFiles = Object.values(fields).reduce((n, f) => n + (f.type === "file" ? f.maxCount : 0), 0);
+  if (totalFiles > MAX_FILES) bad(`at most ${MAX_FILES} files per submission across all file fields; maxCount adds up to ${totalFiles}`);
 
   return {
     id,

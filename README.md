@@ -15,8 +15,8 @@ Part of [Perchlight](https://github.com/matpitts13/perchlight), a free toolkit f
 
 - **Plain HTML works.** On success the browser gets a 303 to your thank-you page (or a built-in one). On a problem it gets a built-in page that says exactly what to fix ("Email is required") and links back to your form.
 - **`fetch()` works too.** JSON in, JSON out: `{ "ok": true, "id": "sub_..." }` or `{ "ok": false, "errors": { "email": "Email is required" } }` with 422 (413 too big, 429 rate limited, 503 couldn't save).
-- **Store first, then notify.** A submission is written to D1 before the visitor is told "thanks". If D1 can't be written, it's emailed straight to you, and only if that works is the visitor thanked; otherwise they see a 503 that says so and gives `FALLBACK_CONTACT`.
-- **Nothing is lost silently.** Each submission is either shown back to the sender as an error they can fix, put in the inbox, or put in the spam folder with its reasons. The one exception: past `SPAM_DAILY_CAP` (1,000 a day) further spam is only counted, so a bot can't use up your D1 writes.
+- **Store first, then notify.** A submission is written to D1 before the visitor is told "thanks". If D1 can't be written, it's emailed straight to you, and only if that works is the visitor thanked; otherwise they see a 503 that says so and gives `FALLBACK_CONTACT`. Spam-flagged posts are never emailed this way, and each Worker instance sends at most 20 such emails an hour (a D1 outage caused by a flood mustn't become an email flood); past that, visitors get the 503. If an attachment can't be written to R2, the visitor gets a 503 saying the file wasn't saved, and nothing is stored.
+- **Nothing is lost silently.** Each submission is either shown back to the sender as an error they can fix, put in the inbox, or put in the spam folder with its reasons. The one exception: past `SPAM_DAILY_CAP` (1,000 a day) further spam is only counted, not stored. A flood still costs some writes: see [What it costs](#what-it-costs).
 - **Spam checks**, each optional per form: a honeypot field, Cloudflare Turnstile (checked server-side), a too-fast check (with the snippet), a per-network rate limit (5 an hour by default) that never stores an IP address, link-count and blocked-word checks, and an origin check. One hard reason (honeypot, wrong origin, a Turnstile token from another site) or two soft ones make a submission spam.
 - **Notifications, once each:** email to your own verified addresses through the free `send_email` binding, or through Resend, Amazon SES, Mailgun, Postmark or Cloudflare Email Service; webhooks to Discord, Slack, ntfy or signed JSON. Retried after 1, 5, 30 minutes, 2 hours and 12 hours; after 24 hours a notification shows as failed, with its error, and can be tried again.
 - **File uploads to R2** (optional): per-field type and size limits, type checked by the file's first bytes, never public, opened through expiring signed links.
@@ -135,6 +135,8 @@ The first sends a sample notification through every channel of the form and repo
 - **Fields not in the config** are kept (up to 10, each cut to 1,000 characters) and flagged "not in config", so a field you add to your HTML and forget here isn't lost. `"extraFields": "drop"` drops them.
 - **Redirects come only from this file** and must be on one of the form's origins; there's no `_next` field (that would be an open redirect).
 - **A form with a mistake is switched off** (its endpoint answers 503) with the reason in `GET /api/forms`; the other forms keep working. Mistakes include a redirect off its origins, a file field without R2 or `LINK_SECRET`, an unknown type, a webhook with no secret, Turnstile on without its secret.
+- **Limits per form:** at most 4 notification channels (email addresses + webhooks + auto-reply) and 5 files per submission, so one post and its notifications fit in one request's subrequest budget. Each address or webhook may be listed only once.
+- **Turnstile action:** `"spam": { "turnstile": true, "turnstileAction": "contact" }` also requires the token's `action` (the widget's `data-action`) to match; a token minted for another form or page is spam.
 - **Blocked words:** your `blockedWords` plus a short built-in list ("seo services", "backlinks", "crypto investment" and a few more; `"defaultBlockedWords": false` turns it off). No language or alphabet rules: they'd flag real people.
 
 ### Settings
@@ -214,22 +216,27 @@ Nothing inside the free plans, measured on the local test run and from the code 
 | Worker requests (free: 100,000/day) | 0 (no cron); 288 if you ping `/tick` every 5 minutes | 1 (+1 preflight for a JSON `fetch` from another site) | about 2,000 (2%) |
 | D1 rows written (free: 100,000/day) | 0; with `/tick`, at most 1 per run when there's no work | about 10 to 15 (submission, notifications and their updates, counters, indexes) | about 15,000 (15%) |
 | D1 rows read (free: 5,000,000/day) | 1 per housekeeping check | about 20 | about 20,000 (0.4%) |
-| Subrequests per request (free: 50) | | 1 Turnstile + 1 per webhook or email-service channel | |
+| Subrequests per request (free: 50) | at most about 20 per housekeeping run | about 6 D1 calls + 1 per file + 1 Turnstile, then about 8 per notification channel (D1 claim, load, finish, the send) | |
 | R2, if used (free: 10 GB, 1M Class A/month) | 0 | 1 write per file | 20 CVs a day of 1 MB: 0.6 GB a month |
 
-Writes would bind first, at roughly 6,000 submissions a day; spam is capped so a bot flood can't use them up. No cron trigger is used (the free plan allows 5 per account). Turnstile is free (unlimited verifications, 20 widgets). Email to your own verified addresses through `send_email` is free on all plans.
+Writes would bind first, at roughly 6,000 submissions a day.
+
+**Subrequests:** whether D1, R2 and `send_email` binding calls count toward the free plan's 50 subrequests per request isn't confirmed in Cloudflare's docs, so the Worker assumes they all do and keeps each request under 45: a post's own notifications are reserved first (that's why forms are limited to 4 channels and 5 files), and the housekeeping run gets what's left, deferring the rest to the next request.
+
+**In a flood:** stored spam stops at `SPAM_DAILY_CAP`, but each post still reaches D1: a post from a new network writes 1 rate-counter row (2 with its index), and one that's past the cap or invalid writes nothing else at once (those counts are kept in memory and written in one batch per minute per Worker instance). A network over its hourly limit is then refused from memory, with no D1 write, by that instance. So a flood from many networks costs roughly 1 to 2 rows written per request, about as many as the Workers free plan's own 100,000 requests a day would allow; it can use up D1's daily writes, but it can't fill your database with spam. No cron trigger is used (the free plan allows 5 per account). Turnstile is free (unlimited verifications, 20 widgets). Email to your own verified addresses through `send_email` is free on all plans.
 
 **R2 asks for a payment method on file** before you can turn it on, even though staying inside its free tier costs nothing. Forms without file fields don't need R2. Auto-replies need an email service (most have a free tier).
 
 ## Tested, and not tested
 
-- `npm test`: 91 tests with vitest and the Workers pool (local D1 and R2), against a fake `send_email`, a fake Turnstile, a fake Resend and fake webhooks. They cover:
+- `npm test`: 110 tests with vitest and the Workers pool (local D1 and R2), against a fake `send_email`, a fake Turnstile, a fake Resend and fake webhooks. They cover:
   - plain HTML posts → 303 to the configured or built-in thank-you page; the problem page naming fields, never showing visitor text, linking back only to the form's own site; no `_next` redirect
   - JSON → JSON, CORS only for allowed origins, preflights, 413 / 415 / 422 / 429
   - multipart uploads stored in R2 with their rows; a renamed `.exe`, a wrong extension, SVG and oversize files refused; files never readable without a valid unexpired signed link or the admin token
   - every spam check (honeypot, origin, Turnstile hostname, too fast, links, blocked words, missing origin, Turnstile unverified), the spam folder, "not spam" sending the skipped notifications once, duplicate collapsing, the 1,000-a-day spam cap
   - rate limiting with no IP address anywhere in D1; keys that change every day
-  - D1 failing → email fallback → thanks; email failing too → 503 naming `FALLBACK_CONTACT`; R2 files removed when the rows can't be written
+  - D1 failing → email fallback → thanks; email failing too → 503 naming `FALLBACK_CONTACT`; R2 files removed when the rows can't be written; spam never emailed in the fallback; the fallback's hourly cap; R2 failing → a 503 that says the file wasn't saved; a constraint error retried rather than treated as an outage
+  - the per-request subrequest budget, channel and file caps, duplicate channels refused, attachments in the duplicate hash, in-memory counters and rate blocks, Turnstile action, non-finite numbers, ntfy byte truncation
   - retries on the 1/5/30/120/720-minute schedule, failed after 24 hours, "Try again" sending once, setup errors failed at once, two overlapping runs sending once, stale claims released
   - lazy housekeeping: the D1 throttle, two runs at once, `/tick`, bounded work per run, retention (inbox, spam, `0` = keep), orphaned R2 files
   - auto-reply: fixed text only, once per address per 24 hours, daily cap, never for spam or unverified Turnstile, unknown not retried, caps released on refusal

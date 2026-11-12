@@ -4,6 +4,8 @@ import { makeWorker } from "../src/app.js";
 import { checkForms, envInfo } from "../src/lib/forms.js";
 import { canAutoReply } from "../src/lib/senders/index.js";
 import { resetLocalThrottle } from "../src/lib/housekeeping.js";
+import { resetCounters, resetBlocked } from "../src/lib/counters.js";
+import { resetFallbackCap } from "../src/routes/submit.js";
 
 export const ORIGIN = "https://forms.test";
 export const SITE = "https://example.com";
@@ -175,6 +177,9 @@ export async function rows(sql, ...params) {
 export async function resetAll() {
   vi.restoreAllMocks();
   resetLocalThrottle();
+  resetCounters();
+  resetBlocked();
+  resetFallbackCap();
   await env.DB.batch(
     ["files", "deliveries", "submissions", "rate_counters", "daily_counts", "autoreply_sent"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)),
   );

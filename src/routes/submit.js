@@ -12,12 +12,25 @@ import { maybeHousekeep } from "../lib/housekeeping.js";
 import { getSender } from "../lib/senders/index.js";
 import { ownerEmail } from "../lib/notify.js";
 import { settings } from "../lib/settings.js";
+import { countLater, isBlocked, block } from "../lib/counters.js";
+import { spend, COST } from "../lib/budget.js";
 
 const DUPLICATE_WINDOW_MS = 10 * 60_000;
+// Fallback emails (sent only while D1 can't be written) per isolate per hour,
+// so a flood that exhausted D1's writes can't turn into an email flood.
+export const FALLBACK_MAX_PER_HOUR = 20;
+let fallbackHour = "";
+let fallbackSent = 0;
+/** Tests only. */
+export function resetFallbackCap() {
+  fallbackHour = "";
+  fallbackSent = 0;
+}
 
-/** CORS headers only for the form's own origins. */
-export function corsHeaders(form, origin) {
-  if (!form || !origin || !form.origins.includes(origin)) return { Vary: "Origin" };
+/** CORS headers only for the form's own origins (a switched-off form keeps
+ *  them, so the browser can read its 503). target: a form or a forms entry. */
+export function corsHeaders(target, origin) {
+  if (!target?.origins || !origin || !target.origins.includes(origin)) return { Vary: "Origin" };
   return {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "POST",
@@ -30,7 +43,7 @@ export function corsHeaders(form, origin) {
 export function preflight(request, app, formId) {
   const entry = app.forms.get(formId);
   if (!entry) return new Response(null, { status: 404, headers: { Vary: "Origin" } });
-  return new Response(null, { status: 204, headers: corsHeaders(entry.form, request.headers.get("Origin")) });
+  return new Response(null, { status: 204, headers: corsHeaders(entry, request.headers.get("Origin")) });
 }
 
 /** "SALT missing" is the deployment's problem; refuse rather than store a guessable hash. */
@@ -53,19 +66,15 @@ function bump(env, formId, kind, now = Date.now()) {
   ).bind(utcDay(now), formId, kind);
 }
 
-function quietly(ctx, promise) {
-  ctx.waitUntil(promise.catch((err) => console.error(`counter: ${err instanceof Error ? err.message : String(err)}`)));
-}
-
 /** The 503 page shown when a submission couldn't be saved or emailed. */
-function cantSavePage(fallbackContact) {
+function cantSavePage(fallbackContact, heading = "We couldn't save your message") {
   const contact = fallbackContact
     ? ` or email <a href="mailto:${escapeHtml(fallbackContact)}">${escapeHtml(fallbackContact)}</a>`
     : "";
   return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Not sent</title><link rel="stylesheet" href="/styles.css"></head><body><main>
-<h1>We couldn't save your message</h1><p>Nothing was sent. Please try again later${contact}.</p>
+<h1>${escapeHtml(heading)}</h1><p>Nothing was sent. Please try again later${contact}.</p>
 <p>Use your browser's Back button to return to the form; what you typed may still be there.</p></main></body></html>`,
     { status: 503, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Retry-After": "3600" } },
   );
@@ -78,7 +87,7 @@ export async function submit(request, app, ctx, formId) {
   const originHeader = request.headers.get("Origin");
   const contentType = request.headers.get("Content-Type") ?? "";
   const wantsJson = bodyKind(contentType) === "json" || (request.headers.get("Accept") ?? "").includes("application/json");
-  const cors = corsHeaders(entry?.form, originHeader);
+  const cors = corsHeaders(entry, originHeader);
 
   if (!entry) {
     return wantsJson
@@ -121,10 +130,11 @@ export async function submit(request, app, ctx, formId) {
   if ("error" in parsed) return problem(parsed.error === "unsupported" ? 415 : 422, { _: parsed.error });
   const sub = await checkSubmission(form, parsed.entries, bodyKind(contentType) === "json");
   if (Object.keys(sub.errors).length) {
-    quietly(ctx, bump(env, form.id, "invalid").run());
+    countLater(env, ctx, form.id, "invalid");
     return problem(422, sub.errors);
   }
 
+  spend(app.budget, COST.post + sub.files.length * COST.file);
   const ip = request.headers.get("CF-Connecting-IP") ?? "";
   let dbOk = true;
   const dbFailed = (err) => {
@@ -136,12 +146,19 @@ export async function submit(request, app, ctx, formId) {
   if (form.spam.perHour > 0 && !sub.honeypot) {
     try {
       const key = await rateKey(env.IP_SALT, utcDay(now), form.id, ip);
+      const hour = new Date(now).toISOString().slice(0, 13);
+      // Already over the limit this hour (seen by this isolate): refused without touching D1.
+      if (isBlocked(key, hour)) {
+        countLater(env, ctx, form.id, "rate_limited");
+        return problem(429, { _: "rate" });
+      }
       const row = await env.DB.prepare(
         `INSERT INTO rate_counters (key, hour, count) VALUES (?1, ?2, 1)
          ON CONFLICT(key, hour) DO UPDATE SET count = count + 1 RETURNING count`,
-      ).bind(key, new Date(now).toISOString().slice(0, 13)).first();
+      ).bind(key, hour).first();
       if (row && row.count > form.spam.perHour) {
-        quietly(ctx, bump(env, form.id, "rate_limited").run());
+        block(key, hour);
+        countLater(env, ctx, form.id, "rate_limited");
         return problem(429, { _: "rate" });
       }
     } catch (err) {
@@ -160,7 +177,9 @@ export async function submit(request, app, ctx, formId) {
 
   // 6. Spam scoring (no network) and duplicates.
   const score = scoreSpam(form, sub, { origin: originHeader, turnstile });
-  const hash = await contentHash(form.id, sub.data, sub.extra);
+  for (const f of sub.files) f.sha256 = await sha256Hex(f.bytes);
+  // Attachments are part of the content: a corrected file isn't a duplicate.
+  const hash = await contentHash(form.id, sub.data, sub.extra, sub.files);
   if (dbOk) {
     try {
       const dup = await env.DB.prepare(
@@ -169,7 +188,7 @@ export async function submit(request, app, ctx, formId) {
          RETURNING id`,
       ).bind(hash, now - DUPLICATE_WINDOW_MS).first();
       if (dup) {
-        quietly(ctx, bump(env, form.id, "duplicate").run());
+        countLater(env, ctx, form.id, "duplicate");
         return success(dup.id);
       }
     } catch (err) {
@@ -186,7 +205,7 @@ export async function submit(request, app, ctx, formId) {
          RETURNING count`,
       ).bind(utcDay(now), settings(env).spamDailyCap).first();
       if (!slot) {
-        quietly(ctx, bump(env, form.id, "spam_dropped").run());
+        countLater(env, ctx, form.id, "spam_dropped");
         return success(randomId("sub")); // the same answer as a real submission
       }
     } catch (err) {
@@ -199,32 +218,37 @@ export async function submit(request, app, ctx, formId) {
   if (!dbOk) return fallback(app, form, sub, score, wantsJson, cors, success, now);
 
   // 7. Files to R2 first, then the rows in one transaction.
-  const id = randomId("sub");
+  const firstId = randomId("sub");
   const created = sqlTime(now);
   const fileRows = [];
   try {
     for (const f of sub.files) {
       const fid = randomId("fil");
-      const key = `f/${form.id}/${id}/${fid}`;
-      await env.FILES.put(key, f.bytes, { httpMetadata: { contentType: f.contentType }, customMetadata: { submission: id } });
-      fileRows.push({ id: fid, field: f.field, name: f.name, contentType: f.contentType, size: f.bytes.byteLength, sha256: await sha256Hex(f.bytes), key });
+      const key = `f/${form.id}/${firstId}/${fid}`;
+      await env.FILES.put(key, f.bytes, { httpMetadata: { contentType: f.contentType }, customMetadata: { submission: firstId } });
+      fileRows.push({ id: fid, field: f.field, name: f.name, contentType: f.contentType, size: f.bytes.byteLength, sha256: f.sha256, key });
     }
   } catch (err) {
+    // Never thank the visitor while dropping their file: say so instead.
     console.error(`R2: ${err instanceof Error ? err.message : String(err)}`);
     await deleteObjects(env, fileRows);
-    return fallback(app, form, sub, score, wantsJson, cors, success, now);
+    const s = settings(env);
+    const message = `We couldn't save your attached file, so nothing was sent. Please try again later${s.fallbackContact ? ` or email ${s.fallbackContact}` : ""}.`;
+    return wantsJson
+      ? json({ ok: false, errors: { _form: message } }, 503, { ...cors, "Retry-After": "3600" })
+      : cantSavePage(s.fallbackContact, "We couldn't save your attached file");
   }
 
   const replyEmail = form.replyTo && typeof sub.data[form.replyTo] === "string" ? sub.data[form.replyTo].toLowerCase() : null;
   const channels = [...form.notify.email.map((e) => `email:${e.toLowerCase()}`), ...form.notify.webhooks.map((w) => `webhook:${w.name}`)];
   if (form.autoReply && !score.spam && turnstileState === "passed" && replyEmail) channels.push("autoreply");
-  const stmts = [
+  const statements = (subId) => [
     env.DB.prepare(
       `INSERT INTO submissions (id, form_id, created_at, created_ms, status, spam_reasons, data, extra, summary, reply_email,
          content_hash, origin, turnstile, seconds_on_page, consent_at, consent_version)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)`,
     ).bind(
-      id,
+      subId,
       form.id,
       created,
       now,
@@ -245,30 +269,54 @@ export async function submit(request, app, ctx, formId) {
       env.DB.prepare(
         `INSERT INTO files (id, submission_id, field, name, content_type, size, sha256, r2_key, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
-      ).bind(f.id, id, f.field, f.name, f.contentType, f.size, f.sha256, f.key, created),
+      ).bind(f.id, subId, f.field, f.name, f.contentType, f.size, f.sha256, f.key, created),
     ),
     ...channels.map((ch) =>
       env.DB.prepare(
         `INSERT INTO deliveries (id, submission_id, channel, status, next_attempt_at, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?5)`,
-      ).bind(randomId("dlv"), id, ch, score.spam ? "skipped" : "pending", now),
+      ).bind(randomId("dlv"), subId, ch, score.spam ? "skipped" : "pending", now),
     ),
     bump(env, form.id, score.spam ? "spam" : "ok", now),
   ];
+  let id = firstId;
   try {
-    await env.DB.batch(stmts);
+    await env.DB.batch(statements(id));
   } catch (err) {
-    dbFailed(err);
-    await deleteObjects(env, fileRows);
-    return fallback(app, form, sub, score, wantsJson, cors, success, now);
+    if (!isConstraintError(err)) {
+      dbFailed(err);
+      await deleteObjects(env, fileRows);
+      return fallback(app, form, sub, score, wantsJson, cors, success, now);
+    }
+    // A constraint error is not D1 being down: it's a clash in our own keys
+    // (duplicate channels are refused by checkForms, so in practice an id
+    // collision). Try once more with fresh ids, logged as such.
+    console.error(`D1 constraint error, not an outage: ${err instanceof Error ? err.message : String(err)}`);
+    id = randomId("sub");
+    try {
+      await env.DB.batch(statements(id));
+    } catch (err2) {
+      // Still failing: a bug. Keep the message by email rather than lose it.
+      console.error(`D1 constraint error again (a bug; please report it): ${err2 instanceof Error ? err2.message : String(err2)}`);
+      await deleteObjects(env, fileRows);
+      return fallback(app, form, sub, score, wantsJson, cors, success, now);
+    }
   }
 
   // 8. Reply; notifications go out after it.
   if (!score.spam && channels.length) {
+    // The post's own notifications are reserved first; the housekeeping run
+    // started by success() only gets what's left of the request's budget.
+    const reserve = COST.deliverySelect + channels.length * COST.delivery;
+    const own = { left: spend(app.budget, reserve) ? reserve : 0 };
     ctx.waitUntil(
-      deliverSubmission(app, id, now).catch((err) => console.error(`notify ${id}: ${err instanceof Error ? err.stack : String(err)}`)),
+      deliverSubmission({ ...app, budget: own }, id, now).catch((err) => console.error(`notify ${id}: ${err instanceof Error ? err.stack : String(err)}`)),
     );
   }
   return success(id);
+}
+
+export function isConstraintError(err) {
+  return /constraint/i.test(err instanceof Error ? err.message : String(err));
 }
 
 async function deleteObjects(env, fileRows) {
@@ -290,7 +338,17 @@ async function fallback(app, form, sub, score, wantsJson, cors, success, now) {
   const s = settings(env);
   let sent = false;
   const got = getSender(env);
-  if (form.notify.email.length && "sender" in got) {
+  const hour = new Date(now).toISOString().slice(0, 13);
+  if (hour !== fallbackHour) {
+    fallbackHour = hour;
+    fallbackSent = 0;
+  }
+  // Spam suspects (a hard reason such as a wrong Origin, or two soft ones)
+  // are never emailed: a flood is the likely reason D1 is out of writes.
+  if (score.spam) console.error("fallback: not emailing a spam-flagged submission while D1 is down");
+  else if (fallbackSent >= FALLBACK_MAX_PER_HOUR) console.error(`fallback: ${FALLBACK_MAX_PER_HOUR} emails an hour already sent by this isolate`);
+  else if (form.notify.email.length && "sender" in got) {
+    fallbackSent++;
     const email = ownerEmail(
       form,
       { id: "", created_at: sqlTime(now), data: sub.data, extra: sub.extra, spam_reasons: score.spam ? score.reasons : null },

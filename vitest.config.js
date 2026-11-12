@@ -24,6 +24,8 @@ export default defineConfig(async () => {
             WEBHOOK_HOOK_URL: "https://hooks.test/json",
             MAIL_FROM: "Forms <forms@example.com>",
             FALLBACK_CONTACT: "help@example.com",
+            // Write refused-post counters at once (production batches them per minute).
+            COUNTER_FLUSH_SECONDS: "0",
           },
         },
       }),
