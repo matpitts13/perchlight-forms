@@ -64,7 +64,7 @@ describe("1. housekeeping from posts alone, on a 4-channel form with 5 files", (
 
   it("retention runs in steps across runs and saves where it got to", async () => {
     await insertOld("sub_aaaaaaaaaaaaaaaa", "new", 400);
-    const app = () => ({ ...makeApp(), budget: { left: COST.housekeepingBase + COST.pending + COST.stateSave + COST.retentionFolder } });
+    const app = () => ({ ...makeApp(), budget: { left: COST.housekeepingBase + COST.stateSave + COST.retentionFolder } });
     const a = await runHousekeeping(app(), { force: true });
     expect(a.retention).toMatchObject({ steps: ["inbox"], complete: false, inbox: 1 });
     expect((await rows("SELECT value FROM state WHERE key = 'retention_step'"))[0].value).toBe("1");

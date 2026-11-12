@@ -152,7 +152,7 @@ describe("6. fewer writes in a flood", () => {
 });
 
 describe("7. R2 delete failing during clean-up", () => {
-  it("logs and carries on deleting rows", async () => {
+  it("logs and carries on; the expired rows wait for a run where R2 works (changed after the final check)", async () => {
     await env.DB.prepare(
       "INSERT INTO submissions (id, form_id, created_at, created_ms, status, data, content_hash) VALUES ('sub_aaaaaaaaaaaaaaaa', 'contact', '2026-01-01 00:00:00', 0, 'spam', '{}', 'h')",
     ).run();
@@ -161,8 +161,10 @@ describe("7. R2 delete failing during clean-up", () => {
     ).run();
     const files = { delete: async () => { throw new Error("R2 down"); }, list: async () => ({ objects: [], truncated: false }) };
     const r = await runHousekeeping(makeApp({ FILES: files }), { force: true });
-    expect(r.retention.spam).toBe(1);
-    expect(await rows("SELECT id FROM submissions")).toHaveLength(0);
+    expect(r.ran).toBe(true);
+    expect(r.retention.complete).toBe(true);
+    expect(r.retention.spam).toBe(0);
+    expect(await rows("SELECT id FROM submissions")).toHaveLength(1);
   });
 });
 

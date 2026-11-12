@@ -5,7 +5,7 @@ import { json, fail, readJson, sqlTime, utcDay } from "../lib/http.js";
 import { safeEqual, isId, randomId } from "../lib/crypto.js";
 import { loadSubmission, deliverSubmission, deliver, sendWebhook } from "../lib/deliveries.js";
 import { deleteSubmissions, maybeHousekeep, runHousekeeping, pendingDeleteCount } from "../lib/housekeeping.js";
-import { spend } from "../lib/budget.js";
+import { spend, COST } from "../lib/budget.js";
 import { signedFileUrl, linkSecretOk } from "../lib/links.js";
 import { getSender, canAutoReply, providerName } from "../lib/senders/index.js";
 import { ownerEmail } from "../lib/notify.js";
@@ -35,15 +35,17 @@ export async function handleAdmin(request, app, ctx, path) {
   const q = url.searchParams;
   const m = request.method;
   const parts = path.split("/").filter(Boolean);
+  // Every call is charged, so the housekeeping run it starts gets only what's left.
+  spend(app.budget, COST.admin);
   let res;
   if (m === "GET" && path === "forms") res = await listForms(app);
   else if (m === "GET" && path === "submissions") res = await listSubmissions(env, q);
-  else if (m === "DELETE" && path === "submissions") res = await deleteByEmail(env, q);
+  else if (m === "DELETE" && path === "submissions") res = await deleteByEmail({ ...env, budget: app.budget }, q);
   else if (parts[0] === "submissions" && parts.length === 2) {
     if (!isId("sub", parts[1])) res = fail(404, "No such submission.");
     else if (m === "GET") res = await getSubmission(env, parts[1]);
     else if (m === "PATCH") res = await patchSubmission(request, app, ctx, parts[1]);
-    else if (m === "DELETE") res = await deleteOne(env, parts[1]);
+    else if (m === "DELETE") res = await deleteOne({ ...env, budget: app.budget }, parts[1]);
   } else if (m === "GET" && path === "export") res = await exportSubmissions(app, q);
   else if (parts[0] === "files" && isId("fil", parts[1] ?? "")) {
     if (m === "GET" && parts.length === 2) res = env.FILES ? await streamFile(env, parts[1], () => fail(404, "No such file.")) : fail(404, "No such file.");
@@ -217,6 +219,7 @@ async function patchSubmission(request, app, ctx, id) {
 }
 
 async function deleteOne(env, id) {
+  spend(env.budget, COST.adminDeleteOne);
   const r = await deleteSubmissions(env, [id]);
   if (!r.deleted) return fail(404, "No such submission.");
   return json({ ok: true, deleted: r.deleted, filesPending: r.filesPending, ...pendingNote(r.filesPending) });
@@ -233,7 +236,8 @@ function pendingNote(n) {
 async function deleteByEmail(env, q) {
   const email = (q.get("email") ?? "").trim().toLowerCase();
   if (!email || email.length > 254 || !email.includes("@")) return fail(400, "Give ?email=someone@example.com");
-  const LIMIT = 450;
+  const LIMIT = 40; // per call, to fit the request budget; "more": true means call again
+  spend(env.budget, COST.adminDeleteByEmail);
   const { results } = await env.DB.prepare("SELECT id FROM submissions WHERE reply_email = ?1 LIMIT ?2").bind(email, LIMIT + 1).all();
   const ids = results.slice(0, LIMIT).map((r) => r.id);
   const { deleted, filesPending } = await deleteSubmissions(env, ids);
@@ -378,6 +382,7 @@ async function retryDelivery(app, ctx, id) {
   const { env } = app;
   if (!isId("dlv", id)) return fail(404, "No such delivery.");
   const now = Date.now();
+  spend(app.budget, COST.adminRetry + COST.delivery + COST.load + COST.autoreply);
   const row = await env.DB.prepare(
     `UPDATE deliveries SET status = 'pending', next_attempt_at = ?2, last_error = NULL
      WHERE id = ?1 AND status IN ('failed', 'unknown', 'retry') RETURNING *`,
@@ -419,6 +424,7 @@ async function testNotify(app, q) {
   if (!entry) return fail(404, "Give ?form=<id> of a form in forms.json.");
   if (!entry.ok) return json({ ok: false, error: `This form is switched off: ${entry.error}` }, 400);
   const form = entry.form;
+  spend(app.budget, form.notify.email.length + form.notify.webhooks.length);
   const data = {};
   for (const field of Object.values(form.fields)) if (field.type !== "file") data[field.name] = sampleValue(field);
   const sub = { id: randomId("sub"), created_at: sqlTime(), data, extra: null, files: [] };

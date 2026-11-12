@@ -27,14 +27,24 @@ export const COST = {
   // pending R2 deletes: select, R2 delete, delete rows
   pending: 3,
   // one retention folder (inbox or spam): select ids, select file keys, R2
-  // delete, delete rows, and on an R2 failure the pending-delete insert
-  retentionFolder: 5,
+  // delete, delete rows. If R2 fails, those rows are left for a later run
+  // (no pending-delete inserts on this path), so 4 is the worst case.
+  retentionFolder: 4,
   // old counters, hashes and delivery rows: one batch
   retentionCounters: 1,
   // R2 orphan sweep: state read, list, two IN (...) selects for 100 keys, R2 delete, cursor update
   retentionSweep: 6,
   // saving retention progress
   stateSave: 1,
+  // admin API: the largest read-only handler (GET /api/forms: 5 queries)
+  admin: 5,
+  // DELETE ...?email= (40 submissions a call, up to 5 files each): select ids,
+  // select keys, R2 delete, up to 5 pending-delete inserts, delete rows
+  adminDeleteByEmail: 9,
+  // DELETE /:id: select keys, R2 delete, a pending insert, delete
+  adminDeleteOne: 4,
+  // POST /deliveries/:id/retry: the update (+ a status read), then one delivery
+  adminRetry: 2,
 };
 
 /** The smallest piece of useful work a housekeeping run can do (one

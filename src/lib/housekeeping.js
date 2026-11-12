@@ -81,52 +81,91 @@ export async function runHousekeeping(app, { now = Date.now(), force = false } =
   } else if (!(await claimSlot(env, "last_run", s.housekeepingMinutes * 60_000, now))) {
     return { ran: false };
   }
-  const revived = await releaseAndRevive(env, now);
-  const { results: stateRows } = await env.DB.prepare(
-    "SELECT key, value FROM state WHERE key IN ('last_retention', 'retention_step')",
-  ).all();
-  const state = Object.fromEntries(stateRows.map((r) => [r.key, r.value]));
+  const result = { ran: true, revived: 0, pendingDeleted: 0, retention: null, deliveries: null };
+  try {
+    result.revived = await releaseAndRevive(env, now);
+    // One read: retention state, whether R2 deletes are pending, whether any notification is due.
+    const { results: stateRows } = await env.DB.prepare(
+      `SELECT key, value FROM state WHERE key IN ('last_retention', 'retention_step')
+       UNION ALL SELECT 'pending', COUNT(*) FROM (SELECT 1 FROM pending_deletes LIMIT 1)
+       UNION ALL SELECT 'due', COUNT(*) FROM (SELECT 1 FROM deliveries WHERE status IN ('pending', 'retry') AND next_attempt_at <= ?1 LIMIT 1)`,
+    ).bind(now).all();
+    const state = Object.fromEntries(stateRows.map((r) => [r.key, r.value]));
 
-  const pendingDeleted = left(app.budget) >= COST.pending ? (spend(app.budget, COST.pending), await retryPendingDeletes(env)) : 0;
-
-  let retention = null;
-  let step = Math.min(Math.max(Number(state.retention_step) || 0, 0), STEPS.length);
-  const due = force || step > 0 || now - (Number(state.last_retention) || 0) >= RETENTION_EVERY_MS;
-  if (due && left(app.budget) >= COST.stateSave + STEPS[step % STEPS.length].cost) {
-    spend(app.budget, COST.stateSave);
-    if (step >= STEPS.length) step = 0;
-    retention = { inbox: 0, spam: 0, orphans: 0, steps: [], complete: false };
-    while (step < STEPS.length && spend(app.budget, STEPS[step].cost)) {
-      await STEPS[step].run(app, now, retention);
-      retention.steps.push(STEPS[step].name);
-      step++;
+    if (Number(state.pending) > 0 && env.FILES && spend(app.budget, COST.pending)) {
+      result.pendingDeleted = await guarded("pending deletes", () => retryPendingDeletes(env), 0);
     }
-    retention.complete = step >= STEPS.length;
-    await env.DB.batch(
-      retention.complete
-        ? [
-            env.DB.prepare("UPDATE state SET value = '0' WHERE key = 'retention_step'"),
-            env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'last_retention'").bind(String(now)),
-          ]
-        : [env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'retention_step'").bind(String(step))],
-    );
-  }
 
-  const deliveries = await deliverDue(app, DELIVERIES_PER_RUN, now);
-  return { ran: true, revived, pendingDeleted, retention, deliveries };
+    // Due notifications keep one delivery's worth of the budget, so a long
+    // retention catch-up never holds retries back; retention still advances
+    // with whatever is beyond that.
+    const keep = Number(state.due) > 0 ? COST.deliverySelect + COST.delivery + COST.load : 0;
+    let step = Math.min(Math.max(Number(state.retention_step) || 0, 0), STEPS.length);
+    if (step >= STEPS.length) step = 0;
+    const due = force || step > 0 || now - (Number(state.last_retention) || 0) >= RETENTION_EVERY_MS;
+    if (due && left(app.budget) - keep >= COST.stateSave + STEPS[step].cost) {
+      spend(app.budget, COST.stateSave);
+      const retention = { inbox: 0, spam: 0, orphans: 0, steps: [], failed: [], complete: false };
+      result.retention = retention;
+      try {
+        while (step < STEPS.length && left(app.budget) - keep >= STEPS[step].cost) {
+          spend(app.budget, STEPS[step].cost);
+          // A step that fails (R2 down, a bad cursor) is logged and passed:
+          // it's tried again on the next cycle, and never blocks the rest.
+          try {
+            await STEPS[step].run(app, now, retention);
+            retention.steps.push(STEPS[step].name);
+          } catch (err) {
+            console.error(`retention step ${STEPS[step].name}: ${err instanceof Error ? err.message : String(err)}`);
+            retention.failed.push(STEPS[step].name);
+            if (STEPS[step].name === "sweep") {
+              await env.DB.prepare("UPDATE state SET value = '' WHERE key = 'r2_cursor'").run().catch(() => {});
+            }
+          }
+          step++;
+        }
+      } finally {
+        retention.complete = step >= STEPS.length;
+        await guarded("saving retention progress", () =>
+          env.DB.batch(
+            retention.complete
+              ? [
+                  env.DB.prepare("UPDATE state SET value = '0' WHERE key = 'retention_step'"),
+                  env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'last_retention'").bind(String(now)),
+                ]
+              : [env.DB.prepare("UPDATE state SET value = ?1 WHERE key = 'retention_step'").bind(String(step))],
+          ),
+        );
+      }
+    }
+  } finally {
+    // Whatever happened above, due notifications still get their turn.
+    result.deliveries = await guarded("deliveries", () => deliverDue(app, DELIVERIES_PER_RUN, now), { tried: 0, sent: 0 });
+  }
+  return result;
+}
+
+async function guarded(what, fn, fallback = null) {
+  try {
+    return await fn();
+  } catch (err) {
+    console.error(`housekeeping, ${what}: ${err instanceof Error ? err.message : String(err)}`);
+    return fallback;
+  }
 }
 
 /**
- * Deletes R2 objects. Returns the keys that couldn't be deleted (R2 down),
- * which the caller records in pending_deletes so the next run retries them.
+ * Deletes R2 objects. Returns the keys that couldn't be deleted (R2 down).
+ * With no FILES binding there's nothing in R2 this Worker can reach, so
+ * nothing is reported as pending.
  */
 async function deleteObjects(env, keys) {
-  if (!keys.length || !env.FILES) return keys.length && !env.FILES ? keys : [];
+  if (!keys.length || !env.FILES) return [];
   try {
     await env.FILES.delete(keys);
     return [];
   } catch (err) {
-    console.error(`R2 delete of ${keys.length} object(s): ${err instanceof Error ? err.message : String(err)}; kept in pending_deletes for the next run`);
+    console.error(`R2 delete of ${keys.length} object(s): ${err instanceof Error ? err.message : String(err)}`);
     return keys;
   }
 }
@@ -152,10 +191,14 @@ export async function retryPendingDeletes(env) {
 
 /**
  * Deletes submissions: R2 files first, then rows (files and deliveries
- * cascade). Files R2 couldn't delete are recorded in pending_deletes.
+ * cascade). If R2 can't delete their files:
+ * - an erasure (the admin API) still deletes the rows and records the files
+ *   in pending_deletes, retried every housekeeping run, and reports them;
+ * - scheduled retention (keepRowsOnR2Failure) leaves those rows for a later
+ *   run instead, so it never needs the pending-delete writes.
  * @returns {Promise<{ deleted: number, filesPending: number }>}
  */
-export async function deleteSubmissions(env, ids) {
+export async function deleteSubmissions(env, ids, { keepRowsOnR2Failure = false } = {}) {
   let deleted = 0;
   let filesPending = 0;
   for (let i = 0; i < ids.length; i += IN_CHUNK) {
@@ -163,6 +206,7 @@ export async function deleteSubmissions(env, ids) {
     const marks = chunk.map((_, j) => `?${j + 1}`).join(", ");
     const { results } = await env.DB.prepare(`SELECT r2_key FROM files WHERE submission_id IN (${marks})`).bind(...chunk).all();
     const failed = await deleteObjects(env, results.map((r) => r.r2_key));
+    if (failed.length && keepRowsOnR2Failure) continue;
     if (failed.length) {
       await recordPending(env, failed);
       filesPending += failed.length;
@@ -190,7 +234,7 @@ async function retentionFolder(app, now, spam, out) {
     `SELECT id FROM submissions WHERE status ${spam ? "=" : "!="} 'spam' AND created_ms < ?1 ORDER BY created_ms LIMIT ?2`,
   ).bind(now - days * DAY, RETENTION_BATCH).all();
   if (!results.length) return;
-  const r = await deleteSubmissions(env, results.map((x) => x.id));
+  const r = await deleteSubmissions(env, results.map((x) => x.id), { keepRowsOnR2Failure: true });
   out[spam ? "spam" : "inbox"] += r.deleted;
 }
 
